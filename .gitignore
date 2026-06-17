@@ -1,0 +1,46 @@
+# Build outputs
+/build/
+/dist/
+/.vs/
+/.vsbt-test/
+**/obj/
+**/Debug/
+**/Release/
+**/x64/Release/
+**/Win32/Release/
+**/*.obj
+**/*.pch
+**/*.pdb
+**/*.ilk
+**/*.exp
+**/*.lib
+**/*.iobj
+**/*.ipdb
+**/*.tlog
+**/*.recipe
+**/*.lastbuildstate
+**/*.res
+**/*.fb2k-component
+
+# SDK sample binaries
+/third_party/foobar2000-sdk/foobar2000/foo_input_validator/*.dll
+
+# Visual Studio local files
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.VC.opendb
+*.ipch
+
+# Nested repository metadata must not be committed
+**/.git/
+**/.git.disabled-for-parent-add/
+
+# Keep required runtime DLLs for packaging
+!third_party/tolk-with-zdsr/x64/*.dll
+!third_party/tolk-with-zdsr/x86/*.dll
+
+# Exclude the separate M3U importer component
+/build_m3u_importer.ps1
+/package_m3u_importer.ps1
+/third_party/foobar2000-sdk/foobar2000/foo_m3u_importer/

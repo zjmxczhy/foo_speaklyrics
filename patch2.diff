@@ -1,0 +1,229 @@
+﻿diff --git a/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/config.h b/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/config.h
+new file mode 100644
+index 0000000..07df180
+--- /dev/null
++++ b/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/config.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include "stdafx.h"
++
++extern cfg_bool cfg_auto_speak;
++extern cfg_int cfg_lead_ms;
++extern cfg_string cfg_lrc_file;
++extern cfg_string cfg_lrc_folder;
++
++void show_settings_dialog(HWND parent);
++bool browse_lrc_file(HWND parent, pfc::string8& out);
++bool browse_lrc_folder(HWND parent, pfc::string8& out);
++void speak_test_message();
+diff --git a/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/config.cpp b/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/config.cpp
+new file mode 100644
+index 0000000..2f3833a
+--- /dev/null
++++ b/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/config.cpp
+@@ -0,0 +1,19 @@
++#include "stdafx.h"
++#include "config.h"
++
++static const GUID guid_cfg_auto_speak = { 0x84c160de, 0xfd7a, 0x4dc9,{ 0x97, 0xf1, 0xa1, 0x52, 0xd6, 0x96, 0xc1, 0x10 } };
++static const GUID guid_cfg_lead_ms = { 0x1c073b2c, 0xed7b, 0x4e41,{ 0xa2, 0x4f, 0xcb, 0x9, 0xda, 0xe4, 0xc2, 0x11 } };
++static const GUID guid_cfg_lrc_file = { 0x65d151be, 0x8aac, 0x49c7,{ 0xbd, 0x69, 0x4c, 0x18, 0xf9, 0xf3, 0x11, 0x8c } };
++static const GUID guid_cfg_lrc_folder = { 0xa27f64f3, 0x98ba, 0x445f,{ 0x92, 0xe0, 0x7f, 0x53, 0x15, 0xda, 0xce, 0x43 } };
++
++cfg_bool cfg_auto_speak(guid_cfg_auto_speak, false);
++cfg_int cfg_lead_ms(guid_cfg_lead_ms, 0);
++cfg_string cfg_lrc_file(guid_cfg_lrc_file, "");
++cfg_string cfg_lrc_folder(guid_cfg_lrc_folder, "");
++
++void speak_test_message() {
++    extern bool tolk_speak(const wchar_t* text, bool interrupt);
++    if (!tolk_speak(L"朗读歌词测试", true)) {
++        popup_message::g_show("无法加载或调用 Tolk.dll。请确认 Tolk.dll 与读屏支持 DLL 已放在组件同一目录。", "朗读歌词");
++    }
++}
+diff --git a/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/lrc_parser.h b/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/lrc_parser.h
+new file mode 100644
+index 0000000..a10af04
+--- /dev/null
++++ b/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/lrc_parser.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include "stdafx.h"
++
++struct lrc_line {
++    int time_ms = 0;
++    std::wstring text;
++};
++
++class lrc_document {
++public:
++    bool load(const std::wstring& path, pfc::string8& error);
++    void clear();
++    bool empty() const { return m_lines.empty(); }
++    int find_index_for_time(int ms) const;
++    const lrc_line* get(size_t index) const;
++    size_t count() const { return m_lines.size(); }
++    const std::wstring& path() const { return m_path; }
++private:
++    std::vector<lrc_line> m_lines;
++    std::wstring m_path;
++};
+diff --git a/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/lrc_parser.cpp b/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/lrc_parser.cpp
+new file mode 100644
+index 0000000..d3a899b
+--- /dev/null
++++ b/third_party/foobar2000-sdk/foobar2000/foo_speaklyrics/lrc_parser.cpp
+@@ -0,0 +1,162 @@
++#include "stdafx.h"
++#include "lrc_parser.h"
++
++static std::wstring trim_copy(std::wstring s) {
++    const wchar_t* ws = L" \t\r\n";
++    const auto b = s.find_first_not_of(ws);
++    if (b == std::wstring::npos) return L"";
++    const auto e = s.find_last_not_of(ws);
++    return s.substr(b, e - b + 1);
++}
++
++static std::wstring utf8_to_wide(const char* data, int len) {
++    if (len <= 0) return L"";
++    int need = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, data, len, nullptr, 0);
++    if (need <= 0) need = MultiByteToWideChar(CP_ACP, 0, data, len, nullptr, 0);
++    if (need <= 0) return L"";
++    std::wstring out(need, L'\0');
++    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, data, len, out.data(), need)) {
++        MultiByteToWideChar(CP_ACP, 0, data, len, out.data(), need);
++    }
++    return out;
++}
++
++static std::wstring bytes_to_wide(const std::vector<uint8_t>& bytes) {
++    if (bytes.size() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
++        const wchar_t* p = reinterpret_cast<const wchar_t*>(bytes.data() + 2);
++        return std::wstring(p, p + ((bytes.size() - 2) / 2));
++    }
++    if (bytes.size() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
++        std::wstring out;
++        for (size_t i = 2; i + 1 < bytes.size(); i += 2) {
++            out.push_back(static_cast<wchar_t>((bytes[i] << 8) | bytes[i + 1]));
++        }
++        return out;
++    }
++    const char* p = reinterpret_cast<const char*>(bytes.data());
++    int len = static_cast<int>(bytes.size());
++    if (bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
++        p += 3; len -= 3;
++    }
++    return utf8_to_wide(p, len);
++}
++
++static bool parse_timestamp(const std::wstring& s, int& out_ms) {
++    size_t colon = s.find(L':');
++    if (colon == std::wstring::npos) return false;
++    try {
++        int minutes = std::stoi(s.substr(0, colon));
++        size_t pos = colon + 1;
++        int seconds = 0;
++        while (pos < s.size() && iswdigit(s[pos])) {
++            seconds = seconds * 10 + (s[pos] - L'0');
++            ++pos;
++        }
++        int frac = 0;
++        int scale = 100;
++        if (pos < s.size() && (s[pos] == L'.' || s[pos] == L':')) {
++            ++pos;
++            int digits = 0;
++            while (pos < s.size() && iswdigit(s[pos]) && digits < 3) {
++                frac = frac * 10 + (s[pos] - L'0');
++                ++pos;
++                ++digits;
++            }
++            if (digits == 1) scale = 100;
++            else if (digits == 2) scale = 10;
++            else scale = 1;
++            frac *= scale;
++        }
++        if (minutes < 0 || seconds < 0 || seconds >= 60) return false;
++        out_ms = minutes * 60000 + seconds * 1000 + frac;
++        return true;
++    } catch (...) {
++        return false;
++    }
++}
++
++static void parse_line(const std::wstring& line, std::vector<lrc_line>& out, int& offset) {
++    std::vector<int> times;
++    size_t pos = 0;
++    size_t textStart = 0;
++    while (pos < line.size() && line[pos] == L'[') {
++        size_t end = line.find(L']', pos + 1);
++        if (end == std::wstring::npos) break;
++        std::wstring tag = line.substr(pos + 1, end - pos - 1);
++        int ms = 0;
++        if (parse_timestamp(tag, ms)) {
++            times.push_back(ms);
++        } else {
++            std::wstring low = tag;
++            std::transform(low.begin(), low.end(), low.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
++            if (low.rfind(L"offset:", 0) == 0) {
++                try { offset = std::stoi(low.substr(7)); } catch (...) {}
++            }
++        }
++        pos = end + 1;
++        textStart = pos;
++    }
++    if (times.empty()) return;
++    std::wstring text = trim_copy(line.substr(textStart));
++    if (text.empty()) return;
++    for (int t : times) out.push_back({ std::max(0, t + offset), text });
++}
++
++bool lrc_document::load(const std::wstring& path, pfc::string8& error) {
++    clear();
++    std::ifstream f(path, std::ios::binary);
++    if (!f) {
++        error = "无法打开 LRC 文件。";
++        return false;
++    }
++    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++    if (bytes.empty()) {
++        error = "LRC 文件为空。";
++        return false;
++    }
++    std::wstring text = bytes_to_wide(bytes);
++    int offset = 0;
++    size_t start = 0;
++    while (start <= text.size()) {
++        size_t end = text.find_first_of(L"\r\n", start);
++        std::wstring line = end == std::wstring::npos ? text.substr(start) : text.substr(start, end - start);
++        parse_line(line, m_lines, offset);
++        if (end == std::wstring::npos) break;
++        start = end + 1;
++        if (start < text.size() && text[start - 1] == L'\r' && text[start] == L'\n') ++start;
++    }
++    std::sort(m_lines.begin(), m_lines.end(), [](const lrc_line& a, const lrc_line& b) { return a.time_ms < b.time_ms; });
++    m_path = path;
++    if (m_lines.empty()) {
++        error = "没有解析到带时间标签的歌词行。";
++        return false;
++    }
++    return true;
++}
++
++void lrc_document::clear() {
++    m_lines.clear();
++    m_path.clear();
++}
++
++int lrc_document::find_index_for_time(int ms) const {
++    int result = -1;
++    for (size_t i = 0; i < m_lines.size(); ++i) {
++        if (m_lines[i].time_ms <= ms) result = static_cast<int>(i);
++        else break;
++    }
++    return result;
++}
++
++const lrc_line* lrc_document::get(size_t index) const {
++    return index < m_lines.size() ? &m_lines[index] : nullptr;
++}
