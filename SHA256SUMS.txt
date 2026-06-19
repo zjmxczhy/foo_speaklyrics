@@ -1,0 +1,3 @@
+44c9aba37b677394a888f75bc95983770d06ec3f9318cfd30472cf8b0c0bbdb6  foo_speaklyrics.fb2k-component
+9ed925cebfe7ecfdf4556d519b35a03346744fd96c60a740229c5383c434052a  foo_speaklyrics-x64.fb2k-component
+346e53cc3282ef695b9407deecceabe602ecbd6b6e884f49bee4711561c373bb  foo_speaklyrics-x86.fb2k-component
