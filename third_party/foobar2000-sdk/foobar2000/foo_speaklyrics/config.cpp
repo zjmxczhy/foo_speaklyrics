@@ -12,6 +12,7 @@ static const GUID guid_cfg_lrc_folder = { 0xa27f64f3, 0x98ba, 0x445f,{ 0x92, 0xe
 static const GUID guid_cfg_temp_lrc_folder = { 0x4ff58d40, 0x357b, 0x4f13,{ 0xa5, 0xce, 0x78, 0x96, 0xf2, 0x5a, 0x43, 0xe2 } };
 static const GUID guid_cfg_lyric_sources = { 0x9e0d41a4, 0x0d0d, 0x4f95,{ 0x8d, 0x66, 0x47, 0x0d, 0x4e, 0x2f, 0xa8, 0xb9 } };
 static const GUID guid_cfg_lrc_encoding = { 0x3d1f6e32, 0x9b6a, 0x4dc3,{ 0x8a, 0xf4, 0x55, 0x5b, 0xb7, 0x2c, 0x01, 0x91 } };
+static const GUID guid_cfg_download_to_lrc_folder = { 0x61e7711f, 0x4f2c, 0x4dd8,{ 0x9b, 0xe2, 0x23, 0xe7, 0x7a, 0x38, 0x51, 0x44 } };
 static const GUID guid_cfg_use_screen_reader = { 0x7a1d0a52, 0x1b75, 0x4d1f,{ 0x91, 0x8d, 0x69, 0x14, 0x45, 0x12, 0x35, 0x77 } };
 static const GUID guid_cfg_tts_voice_type = { 0x25e6539b, 0x63c8, 0x487b,{ 0x9d, 0x5f, 0x12, 0x4d, 0xde, 0x24, 0xa1, 0x0e } };
 static const GUID guid_cfg_tts_voice_id = { 0xe6ab9ec3, 0x7995, 0x4882,{ 0x82, 0x4c, 0xae, 0x4f, 0x66, 0x9d, 0xc5, 0x92 } };
@@ -27,6 +28,7 @@ cfg_var_modern::cfg_string cfg_lrc_folder(guid_cfg_lrc_folder, "");
 cfg_var_modern::cfg_string cfg_temp_lrc_folder(guid_cfg_temp_lrc_folder, "%Temp%");
 cfg_var_modern::cfg_string cfg_lyric_sources(guid_cfg_lyric_sources, "lrclib,qq1");
 cfg_var_modern::cfg_string cfg_lrc_encoding(guid_cfg_lrc_encoding, "auto");
+cfg_var_modern::cfg_bool cfg_download_to_lrc_folder(guid_cfg_download_to_lrc_folder, false);
 cfg_var_modern::cfg_bool cfg_use_screen_reader(guid_cfg_use_screen_reader, true);
 cfg_var_modern::cfg_string cfg_tts_voice_type(guid_cfg_tts_voice_type, "sapi5");
 cfg_var_modern::cfg_string cfg_tts_voice_id(guid_cfg_tts_voice_id, "");

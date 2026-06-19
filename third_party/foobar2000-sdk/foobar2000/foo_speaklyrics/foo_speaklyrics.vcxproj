@@ -90,7 +90,7 @@
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>../shared/shared-$(Platform).lib;Comdlg32.lib;Shell32.lib;Ole32.lib;Comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>../shared/shared-$(Platform).lib;Comdlg32.lib;Shell32.lib;Ole32.lib;OleAut32.lib;Sapi.lib;Comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -112,7 +112,7 @@
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>../shared/shared-$(Platform).lib;Comdlg32.lib;Shell32.lib;Ole32.lib;Comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>../shared/shared-$(Platform).lib;Comdlg32.lib;Shell32.lib;Ole32.lib;OleAut32.lib;Sapi.lib;Comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -137,7 +137,7 @@
       <SubSystem>Windows</SubSystem>
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
-      <AdditionalDependencies>../shared/shared-$(Platform).lib;Comdlg32.lib;Shell32.lib;Ole32.lib;Comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>../shared/shared-$(Platform).lib;Comdlg32.lib;Shell32.lib;Ole32.lib;OleAut32.lib;Sapi.lib;Comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -162,7 +162,7 @@
       <SubSystem>Windows</SubSystem>
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
-      <AdditionalDependencies>../shared/shared-$(Platform).lib;Comdlg32.lib;Shell32.lib;Ole32.lib;Comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>../shared/shared-$(Platform).lib;Comdlg32.lib;Shell32.lib;Ole32.lib;OleAut32.lib;Sapi.lib;Comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -181,6 +181,7 @@
     </ClCompile>
     <ClCompile Include="playback.cpp" />
     <ClCompile Include="settings_dialog.cpp" />
+    <ClCompile Include="sapi_speech.cpp" />
     <ClCompile Include="speech_engine.cpp" />
     <ClCompile Include="tolk_bridge.cpp" />
   </ItemGroup>
@@ -191,6 +192,7 @@
     <ClInclude Include="lyrics_search_window.h" />
     <ClInclude Include="playback.h" />
     <ClInclude Include="resource.h" />
+    <ClInclude Include="sapi_speech.h" />
     <ClInclude Include="speech_engine.h" />
     <ClInclude Include="stdafx.h" />
     <ClInclude Include="tolk_bridge.h" />

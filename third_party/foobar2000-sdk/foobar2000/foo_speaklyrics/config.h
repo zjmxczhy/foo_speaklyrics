@@ -11,6 +11,7 @@ extern cfg_var_modern::cfg_string cfg_lrc_folder;
 extern cfg_var_modern::cfg_string cfg_temp_lrc_folder;
 extern cfg_var_modern::cfg_string cfg_lrc_encoding;
 extern cfg_var_modern::cfg_string cfg_lyric_sources;
+extern cfg_var_modern::cfg_bool cfg_download_to_lrc_folder;
 extern cfg_var_modern::cfg_bool cfg_use_screen_reader;
 extern cfg_var_modern::cfg_string cfg_tts_voice_type;
 extern cfg_var_modern::cfg_string cfg_tts_voice_id;

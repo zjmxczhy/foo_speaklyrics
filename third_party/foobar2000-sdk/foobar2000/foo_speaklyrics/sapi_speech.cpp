@@ -140,6 +140,7 @@ void purge_sapi_queue() {
 
 DWORD WINAPI sapi_worker_proc(void*) {
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool coInitialized = SUCCEEDED(hrCo);
 
     for (;;) {
         WaitForSingleObject(g_sapi_event, INFINITE);
@@ -168,7 +169,7 @@ DWORD WINAPI sapi_worker_proc(void*) {
     }
 
     purge_sapi_queue();
-    if (SUCCEEDED(hrCo)) CoUninitialize();
+    if (coInitialized) CoUninitialize();
     return 0;
 }
 
@@ -216,6 +217,7 @@ void post_task(sapi_task_kind kind, const wchar_t* voiceType, const wchar_t* voi
 std::vector<sapi_voice_info> sapi_enumerate_voices(const wchar_t* voiceType) {
     std::vector<sapi_voice_info> out;
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool coInitialized = SUCCEEDED(hrCo);
     IEnumSpObjectTokens* tokens = nullptr;
     ULONG count = 0;
     tokens = enum_voice_tokens(voiceType);
@@ -235,7 +237,7 @@ std::vector<sapi_voice_info> sapi_enumerate_voices(const wchar_t* voiceType) {
         }
         tokens->Release();
     }
-    if (SUCCEEDED(hrCo)) CoUninitialize();
+    if (coInitialized) CoUninitialize();
     return out;
 }
 

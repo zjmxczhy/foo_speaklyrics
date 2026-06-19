@@ -235,19 +235,19 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
 
 
-    std::wstring tempFolder = cfg_path_wide(cfg_temp_lrc_folder);
+    std::wstring outputFolder = cfg_path_wide(cfg_download_to_lrc_folder.get() ? cfg_lrc_folder : cfg_temp_lrc_folder);
 
-    if (tempFolder.empty()) return;
+    if (outputFolder.empty()) return;
 
 
 
     std::error_code ec;
 
-    fs::create_directories(tempFolder, ec);
+    fs::create_directories(outputFolder, ec);
 
-    if (ec || !fs::is_directory(tempFolder, ec)) {
+    if (ec || !fs::is_directory(outputFolder, ec)) {
 
-        FB2K_console_formatter() << "foo_speaklyrics: temporary lrc folder is not available: " << pfc::stringcvt::string_utf8_from_wide(tempFolder.c_str()).get_ptr();
+        FB2K_console_formatter() << "foo_speaklyrics: lrc download output folder is not available: " << pfc::stringcvt::string_utf8_from_wide(outputFolder.c_str()).get_ptr();
 
         g_downloader_requested_track_key = key;
 
@@ -297,7 +297,7 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
         L" --sources " + command_line_quote(sources) +
 
-        L" --out " + command_line_quote(tempFolder);
+        L" --out " + command_line_quote(outputFolder);
 
 
 

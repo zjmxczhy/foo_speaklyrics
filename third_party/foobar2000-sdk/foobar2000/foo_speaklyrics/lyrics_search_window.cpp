@@ -270,7 +270,8 @@ bool has_enabled_sources() {
 }
 
 std::wstring output_folder_for_download(bool permanent) {
-    return expand_environment_path(permanent ? cfg_to_wide_local(cfg_lrc_folder) : cfg_to_wide_local(cfg_temp_lrc_folder));
+    bool toLrcFolder = permanent || cfg_download_to_lrc_folder.get();
+    return expand_environment_path(toLrcFolder ? cfg_to_wide_local(cfg_lrc_folder) : cfg_to_wide_local(cfg_temp_lrc_folder));
 }
 
 bool download_item_to_folder(const search_result_item& item, const std::wstring& folder, std::wstring& error) {
@@ -374,8 +375,8 @@ void start_search() {
             payload->items.push_back(empty);
         } else if (should_auto_download(payload->items.front())) {
             std::wstring error;
-            std::wstring tempFolder = expand_environment_path(cfg_to_wide_local(cfg_temp_lrc_folder));
-            if (!trim_text(tempFolder).empty() && download_item_to_folder(payload->items.front(), tempFolder, error)) {
+            std::wstring outputFolder = output_folder_for_download(false);
+            if (!trim_text(outputFolder).empty() && download_item_to_folder(payload->items.front(), outputFolder, error)) {
                 payload->auto_downloaded = true;
             }
         }
