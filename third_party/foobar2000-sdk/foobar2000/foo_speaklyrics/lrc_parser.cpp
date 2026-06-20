@@ -168,6 +168,11 @@ static std::wstring bytes_to_wide(const std::vector<uint8_t>& bytes) {
         if (ok) return out;
     }
 
+    {
+        std::wstring utf8;
+        if (decode_codepage(data, len, CP_UTF8, true, utf8)) return utf8;
+    }
+
     std::wstring best;
     int bestScore = -1000000;
     for (const auto& candidate : g_lrc_encoding_candidates) {
