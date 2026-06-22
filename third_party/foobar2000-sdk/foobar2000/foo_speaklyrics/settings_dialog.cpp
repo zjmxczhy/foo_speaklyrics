@@ -298,6 +298,14 @@ static const int k_tts_page_controls[] = {
     IDC_TTS_TEST,
 };
 
+static const int k_about_page_controls[] = {
+    IDC_STATIC_ABOUT_PURPOSE,
+    IDC_ABOUT_PURPOSE,
+    IDC_ABOUT_GITHUB_REPO,
+    IDC_ABOUT_GITHUB_RELEASES,
+    IDC_ABOUT_GITEE_RELEASES,
+};
+
 static void set_apply_visible(HWND wnd, bool visible) {
     HWND apply = GetDlgItem(wnd, IDC_APPLY_SETTINGS);
     if (!apply) return;
@@ -339,6 +347,9 @@ static void show_settings_page(HWND wnd, int page) {
     for (int id : k_tts_page_controls) {
         set_control_page_visible(wnd, id, page == 2);
     }
+    for (int id : k_about_page_controls) {
+        set_control_page_visible(wnd, id, page == 3);
+    }
     if (page == 2) update_tts_detail_visibility(wnd);
 }
 
@@ -355,6 +366,8 @@ static void init_settings_tabs(HWND wnd) {
     TabCtrl_InsertItem(tab, 1, &item);
     item.pszText = const_cast<wchar_t*>(L"TTS\u8bed\u97f3");
     TabCtrl_InsertItem(tab, 2, &item);
+    item.pszText = const_cast<wchar_t*>(L"\u5173\u4e8e");
+    TabCtrl_InsertItem(tab, 3, &item);
     TabCtrl_SetCurSel(tab, 0);
 }
 
@@ -439,6 +452,17 @@ static void init_tts_controls(HWND wnd) {
     update_tts_detail_visibility(wnd);
 }
 
+static void init_about_controls(HWND wnd) {
+    SetWindowTextW(GetDlgItem(wnd, IDC_ABOUT_PURPOSE), L"\u4e3b\u8981\u7528\u9014");
+    SetDlgItemTextW(wnd, IDC_ABOUT_PURPOSE,
+        L"\u5728\u64ad\u653e\u6b4c\u66f2\u65f6\u8bfb\u53d6 LRC \u6b4c\u8bcd\uff0c"
+        L"\u5e76\u901a\u8fc7\u5c4f\u5e55\u9605\u8bfb\u5668/Tolk \u6216 SAPI5.1 \u6717\u8bfb\u5f53\u524d\u6b4c\u8bcd\u3002");
+}
+
+static void open_url(HWND wnd, const wchar_t* url) {
+    ShellExecuteW(wnd, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 static void set_dialog_dirty(HWND wnd, bool dirty) {
     if (g_settings_dialog_initializing) return;
     SetWindowLongPtr(wnd, DWLP_USER, dirty ? 1 : 0);
@@ -493,6 +517,8 @@ static void init_dialog(HWND wnd) {
     init_source_list(wnd);
 
     init_tts_controls(wnd);
+
+    init_about_controls(wnd);
 
     show_settings_page(wnd, 0);
 
@@ -662,6 +688,24 @@ static INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_TTS_TEST:
 
             sapi_speak(L"sapi5", current_tts_voice_id(wnd).c_str(), current_tts_rate(wnd), get_dlg_text(wnd, IDC_TTS_TEST_TEXT).c_str(), true);
+
+            return TRUE;
+
+        case IDC_ABOUT_GITHUB_REPO:
+
+            open_url(wnd, L"https://github.com/zjmxczhy/foo_speaklyrics");
+
+            return TRUE;
+
+        case IDC_ABOUT_GITHUB_RELEASES:
+
+            open_url(wnd, L"https://github.com/zjmxczhy/foo_speaklyrics/releases");
+
+            return TRUE;
+
+        case IDC_ABOUT_GITEE_RELEASES:
+
+            open_url(wnd, L"https://gitee.com/zjmxczhy/foo_speaklyrics/releases");
 
             return TRUE;
 
