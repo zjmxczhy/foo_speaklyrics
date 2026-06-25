@@ -171,6 +171,7 @@
     <ClCompile Include="lrc_parser.cpp" />
     <ClCompile Include="lyrics_jump_window.cpp" />
     <ClCompile Include="lyrics_search_window.cpp" />
+    <ClCompile Include="lyrics_timestamp_window.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="mainmenu.cpp" />
     <ClCompile Include="PCH.cpp">
@@ -190,6 +191,7 @@
     <ClInclude Include="lrc_parser.h" />
     <ClInclude Include="lyrics_jump_window.h" />
     <ClInclude Include="lyrics_search_window.h" />
+    <ClInclude Include="lyrics_timestamp_window.h" />
     <ClInclude Include="playback.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="sapi_speech.h" />

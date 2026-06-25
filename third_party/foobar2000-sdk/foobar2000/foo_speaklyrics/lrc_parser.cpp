@@ -14,19 +14,52 @@ struct lrc_encoding_candidate {
     const char* id;
     const wchar_t* name;
     UINT codepage;
+    bool write_bom;
 };
 
 static const lrc_encoding_candidate g_lrc_encoding_candidates[] = {
-    { "utf8", L"UTF-8", CP_UTF8 },
-    { "gb18030", L"GB18030", 54936 },
-    { "gbk", L"GBK", 936 },
-    { "big5", L"Big5", 950 },
-    { "shiftjis", L"Shift-JIS", 932 },
-    { "korean", L"Korean", 949 },
-    { "windows1252", L"Windows-1252", 1252 },
-    { "windows1254", L"Windows-1254", 1254 },
-    { "acp", L"system ANSI", CP_ACP },
+    { "auto", L"\u81ea\u52a8", CP_UTF8, false },
+    { "utf8", L"Unicode (UTF-8)", CP_UTF8, false },
+    { "utf8bom", L"Unicode (UTF-8 with BOM)", CP_UTF8, true },
+    { "utf16le", L"Unicode (UTF-16 LE)", 1200, true },
+    { "utf16be", L"Unicode (UTF-16 BE)", 1201, true },
+    { "gbk", L"Simplified Chinese (GBK)", 936, false },
+    { "gb18030", L"Chinese Simplified (GB18030)", 54936, false },
+    { "big5", L"Traditional Chinese (Big5)", 950, false },
+    { "shiftjis", L"ANSI/OEM Japanese (Shift-JIS)", 932, false },
+    { "korean", L"ANSI/OEM Korean (Unified Hangul Code)", 949, false },
+    { "windows1252", L"Western European (Windows)", 1252, false },
+    { "windows1254", L"Turkish (Windows)", 1254, false },
+    { "acp", L"\u7cfb\u7edf\u9ed8\u8ba4 ANSI", CP_ACP, false },
 };
+
+static const lrc_encoding_info g_lrc_encoding_options[] = {
+    { "auto", L"\u81ea\u52a8" },
+    { "utf8", L"Unicode (UTF-8)" },
+    { "utf8bom", L"Unicode (UTF-8 with BOM)" },
+    { "utf16le", L"Unicode (UTF-16 LE)" },
+    { "utf16be", L"Unicode (UTF-16 BE)" },
+    { "gbk", L"Simplified Chinese (GBK)" },
+    { "gb18030", L"Chinese Simplified (GB18030)" },
+    { "big5", L"Traditional Chinese (Big5)" },
+    { "shiftjis", L"ANSI/OEM Japanese (Shift-JIS)" },
+    { "korean", L"ANSI/OEM Korean (Unified Hangul Code)" },
+    { "windows1252", L"Western European (Windows)" },
+    { "windows1254", L"Turkish (Windows)" },
+    { "acp", L"\u7cfb\u7edf\u9ed8\u8ba4 ANSI" },
+};
+
+static bool same_encoding_id(const char* a, const char* b) {
+    return a && b && _stricmp(a, b) == 0;
+}
+
+static const lrc_encoding_candidate* find_encoding_candidate(const char* id) {
+    if (!id || !*id) return nullptr;
+    for (const auto& candidate : g_lrc_encoding_candidates) {
+        if (same_encoding_id(id, candidate.id)) return &candidate;
+    }
+    return nullptr;
+}
 
 static std::string cfg_lrc_encoding_id() {
     pfc::string8 value = cfg_lrc_encoding.get();
@@ -127,7 +160,7 @@ static std::wstring decode_by_id(const std::vector<uint8_t>& bytes, const std::s
     }
     const char* data = reinterpret_cast<const char*>(bytes.data());
     int len = static_cast<int>(bytes.size());
-    if (id == "utf8" && bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
+    if ((id == "utf8" || id == "utf8bom") && bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
         data += 3;
         len -= 3;
     }
@@ -141,23 +174,33 @@ static std::wstring decode_by_id(const std::vector<uint8_t>& bytes, const std::s
     return out;
 }
 
-static std::wstring bytes_to_wide(const std::vector<uint8_t>& bytes) {
+static std::wstring bytes_to_wide(const std::vector<uint8_t>& bytes, std::string* detected_encoding_id, bool use_forced_config) {
+    if (detected_encoding_id) detected_encoding_id->clear();
     if (bytes.empty()) return L"";
 
     if (bytes.size() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
         std::wstring out;
-        if (decode_utf16_le(bytes.data(), bytes.size(), out)) return out;
+        if (decode_utf16_le(bytes.data(), bytes.size(), out)) {
+            if (detected_encoding_id) *detected_encoding_id = "utf16le";
+            return out;
+        }
     }
     if (bytes.size() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
         std::wstring out;
-        if (decode_utf16_be(bytes.data(), bytes.size(), out)) return out;
+        if (decode_utf16_be(bytes.data(), bytes.size(), out)) {
+            if (detected_encoding_id) *detected_encoding_id = "utf16be";
+            return out;
+        }
     }
 
-    std::string forced = cfg_lrc_encoding_id();
+    std::string forced = use_forced_config ? cfg_lrc_encoding_id() : std::string();
     if (!forced.empty() && forced != "auto") {
         bool ok = false;
         std::wstring out = decode_by_id(bytes, forced, ok);
-        if (ok) return out;
+        if (ok) {
+            if (detected_encoding_id) *detected_encoding_id = forced;
+            return out;
+        }
     }
 
     const char* data = reinterpret_cast<const char*>(bytes.data());
@@ -165,26 +208,40 @@ static std::wstring bytes_to_wide(const std::vector<uint8_t>& bytes) {
     if (bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
         bool ok = false;
         std::wstring out = decode_by_id(bytes, "utf8", ok);
-        if (ok) return out;
+        if (ok) {
+            if (detected_encoding_id) *detected_encoding_id = "utf8bom";
+            return out;
+        }
     }
 
     {
         std::wstring utf8;
-        if (decode_codepage(data, len, CP_UTF8, true, utf8)) return utf8;
+        if (decode_codepage(data, len, CP_UTF8, true, utf8)) {
+            if (detected_encoding_id) *detected_encoding_id = "utf8";
+            return utf8;
+        }
     }
 
     std::wstring best;
+    std::string bestId;
     int bestScore = -1000000;
     for (const auto& candidate : g_lrc_encoding_candidates) {
+        if (same_encoding_id(candidate.id, "auto") || same_encoding_id(candidate.id, "utf8bom") || same_encoding_id(candidate.id, "utf16le") || same_encoding_id(candidate.id, "utf16be")) continue;
         std::wstring decoded;
         if (!decode_codepage(data, len, candidate.codepage, candidate.codepage == CP_UTF8, decoded)) continue;
         int score = score_decoded_lrc(decoded);
         if (score > bestScore) {
             bestScore = score;
+            bestId = candidate.id;
             best = std::move(decoded);
         }
     }
+    if (detected_encoding_id) *detected_encoding_id = bestId;
     return best;
+}
+
+static std::wstring bytes_to_wide(const std::vector<uint8_t>& bytes) {
+    return bytes_to_wide(bytes, nullptr, true);
 }
 
 static bool parse_timestamp(const std::wstring& s, int& out_ms) {
@@ -267,19 +324,120 @@ static void parse_line(const std::wstring& line, std::vector<lrc_line>& out, int
     for (int t : times) out.push_back({ (std::max)(0, t + offset), text });
 }
 
-bool lrc_document::load(const std::wstring& path, pfc::string8& error) {
-    clear();
+const lrc_encoding_info* lrc_get_encoding_options(size_t& count) {
+    count = _countof(g_lrc_encoding_options);
+    return g_lrc_encoding_options;
+}
+
+int lrc_find_encoding_index(const char* id) {
+    if (!id || !*id) return 0;
+    for (int i = 0; i < static_cast<int>(_countof(g_lrc_encoding_options)); ++i) {
+        if (same_encoding_id(g_lrc_encoding_options[i].id, id)) return i;
+    }
+    return 0;
+}
+
+static std::wstring lrc_read_text_file_impl(const std::wstring& path, std::string* detected_encoding_id, pfc::string8& error, bool use_forced_config) {
+    error = "";
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         error = "无法打开 LRC 文件。";
-        return false;
+        return std::wstring();
     }
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (bytes.empty()) {
         error = "LRC 文件为空。";
+        return std::wstring();
+    }
+    return bytes_to_wide(bytes, detected_encoding_id, use_forced_config);
+}
+
+std::wstring lrc_read_text_file(const std::wstring& path, std::string* detected_encoding_id, pfc::string8& error) {
+    return lrc_read_text_file_impl(path, detected_encoding_id, error, true);
+}
+
+std::wstring lrc_read_text_file_auto(const std::wstring& path, std::string* detected_encoding_id, pfc::string8& error) {
+    return lrc_read_text_file_impl(path, detected_encoding_id, error, false);
+}
+
+static bool append_multibyte_encoded(std::vector<uint8_t>& bytes, const std::wstring& text, UINT codepage, bool strict) {
+    if (text.empty()) return true;
+    DWORD flags = strict ? WC_ERR_INVALID_CHARS : 0;
+    int need = WideCharToMultiByte(codepage, flags, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (need <= 0 && strict) {
+        flags = 0;
+        need = WideCharToMultiByte(codepage, flags, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    }
+    if (need <= 0) return false;
+    size_t oldSize = bytes.size();
+    bytes.resize(oldSize + static_cast<size_t>(need));
+    int written = WideCharToMultiByte(codepage, flags, text.data(), static_cast<int>(text.size()), reinterpret_cast<char*>(bytes.data() + oldSize), need, nullptr, nullptr);
+    if (written <= 0) {
+        bytes.resize(oldSize);
         return false;
     }
-    std::wstring text = bytes_to_wide(bytes);
+    bytes.resize(oldSize + static_cast<size_t>(written));
+    return true;
+}
+
+bool lrc_write_text_file(const std::wstring& path, const std::wstring& text, const char* encoding_id, pfc::string8& error) {
+    error = "";
+    const char* id = encoding_id && *encoding_id ? encoding_id : "utf8";
+    if (same_encoding_id(id, "auto")) id = "utf8";
+    const lrc_encoding_candidate* encoding = find_encoding_candidate(id);
+    if (!encoding || same_encoding_id(encoding->id, "auto")) encoding = find_encoding_candidate("utf8");
+    if (!encoding) {
+        error = "不支持的 LRC 编码。";
+        return false;
+    }
+
+    std::vector<uint8_t> bytes;
+    if (same_encoding_id(encoding->id, "utf8bom")) {
+        bytes.push_back(0xEF);
+        bytes.push_back(0xBB);
+        bytes.push_back(0xBF);
+        if (!append_multibyte_encoded(bytes, text, CP_UTF8, true)) {
+            error = "无法按 UTF-8 编码保存 LRC 文件。";
+            return false;
+        }
+    } else if (same_encoding_id(encoding->id, "utf16le")) {
+        bytes.push_back(0xFF);
+        bytes.push_back(0xFE);
+        for (wchar_t ch : text) {
+            bytes.push_back(static_cast<uint8_t>(ch & 0xFF));
+            bytes.push_back(static_cast<uint8_t>((ch >> 8) & 0xFF));
+        }
+    } else if (same_encoding_id(encoding->id, "utf16be")) {
+        bytes.push_back(0xFE);
+        bytes.push_back(0xFF);
+        for (wchar_t ch : text) {
+            bytes.push_back(static_cast<uint8_t>((ch >> 8) & 0xFF));
+            bytes.push_back(static_cast<uint8_t>(ch & 0xFF));
+        }
+    } else {
+        if (!append_multibyte_encoded(bytes, text, encoding->codepage, encoding->codepage == CP_UTF8)) {
+            error = "无法按选择的编码保存 LRC 文件。";
+            return false;
+        }
+    }
+
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        error = "无法写入 LRC 文件。";
+        return false;
+    }
+    if (!bytes.empty()) f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!f) {
+        error = "写入 LRC 文件失败。";
+        return false;
+    }
+    return true;
+}
+
+bool lrc_document::load(const std::wstring& path, pfc::string8& error) {
+    clear();
+    std::wstring text = lrc_read_text_file(path, nullptr, error);
+    if (error.length() > 0) return false;
     int offset = 0;
     size_t start = 0;
     while (start <= text.size()) {

@@ -4,6 +4,8 @@
 
 #include "playback.h"
 
+#include "lrc_parser.h"
+
 #include "resource.h"
 
 #include "sapi_speech.h"
@@ -143,51 +145,27 @@ static const lyric_source_item g_lyric_sources[] = {
 };
 
 
-struct lrc_encoding_item {
-    const char* id;
-    const wchar_t* name;
-};
-
-static const lrc_encoding_item g_lrc_encodings[] = {
-    { "auto", L"\u81ea\u52a8" },
-    { "utf8", L"Unicode (UTF-8)" },
-    { "utf16le", L"Unicode (UTF-16 LE)" },
-    { "utf16be", L"Unicode (UTF-16 BE)" },
-    { "gbk", L"Simplified Chinese (GBK)" },
-    { "gb18030", L"Chinese Simplified (GB18030)" },
-    { "big5", L"Traditional Chinese (Big5)" },
-    { "shiftjis", L"ANSI/OEM Japanese (Shift-JIS)" },
-    { "korean", L"ANSI/OEM Korean (Unified Hangul Code)" },
-    { "windows1252", L"Western European (Windows)" },
-    { "windows1254", L"Turkish (Windows)" },
-    { "acp", L"\u7cfb\u7edf\u9ed8\u8ba4 ANSI" },
-};
-
-static int find_lrc_encoding_index(const char* id) {
-    if (!id || !*id) return 0;
-    for (int i = 0; i < static_cast<int>(_countof(g_lrc_encodings)); ++i) {
-        if (_stricmp(g_lrc_encodings[i].id, id) == 0) return i;
-    }
-    return 0;
-}
-
 static void init_lrc_encoding_combo(HWND wnd) {
     HWND combo = GetDlgItem(wnd, IDC_LRC_ENCODING);
     if (!combo) return;
     SetWindowTextW(combo, L"LRC\u6b4c\u8bcd\u7f16\u7801");
-    for (const auto& item : g_lrc_encodings) {
-        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.name));
+    size_t count = 0;
+    const lrc_encoding_info* encodings = lrc_get_encoding_options(count);
+    for (size_t i = 0; i < count; ++i) {
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(encodings[i].name));
     }
     pfc::string8 id = cfg_lrc_encoding.get();
-    SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(find_lrc_encoding_index(id.get_ptr())), 0);
+    SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(lrc_find_encoding_index(id.get_ptr())), 0);
 }
 
 static void save_lrc_encoding_combo(HWND wnd) {
     HWND combo = GetDlgItem(wnd, IDC_LRC_ENCODING);
     if (!combo) return;
     int index = static_cast<int>(SendMessageW(combo, CB_GETCURSEL, 0, 0));
-    if (index < 0 || index >= static_cast<int>(_countof(g_lrc_encodings))) index = 0;
-    cfg_lrc_encoding.set(g_lrc_encodings[index].id);
+    size_t count = 0;
+    const lrc_encoding_info* encodings = lrc_get_encoding_options(count);
+    if (index < 0 || index >= static_cast<int>(count)) index = 0;
+    cfg_lrc_encoding.set(encodings[index].id);
 }
 
 static bool csv_has_token(const std::string& csv, const char* token) {
