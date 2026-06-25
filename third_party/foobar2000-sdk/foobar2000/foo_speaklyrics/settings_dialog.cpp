@@ -144,6 +144,47 @@ static const lyric_source_item g_lyric_sources[] = {
     { "netease", L"\u7f51\u6613\u4e91\u97f3\u4e50" },
 };
 
+struct announce_track_format_item {
+    const char* id;
+    const wchar_t* name;
+};
+
+static const announce_track_format_item g_announce_track_formats[] = {
+    { "title_artist", L"\u6807\u9898\u548c\u827a\u672f\u5bb6" },
+    { "title", L"\u6807\u9898" },
+    { "artist_title", L"\u827a\u672f\u5bb6\u548c\u6807\u9898" },
+    { "filename", L"\u6587\u4ef6\u540d" },
+    { "filename_no_ext", L"\u6587\u4ef6\u540d\u4e0d\u542b\u6269\u5c55\u540d" },
+};
+
+static int find_announce_track_format_index(const char* id) {
+    if (!id || !*id) return 0;
+    for (int i = 0; i < static_cast<int>(_countof(g_announce_track_formats)); ++i) {
+        if (_stricmp(g_announce_track_formats[i].id, id) == 0) return i;
+    }
+    return 0;
+}
+
+static void init_announce_track_format_combo(HWND wnd) {
+    HWND combo = GetDlgItem(wnd, IDC_ANNOUNCE_TRACK_FORMAT);
+    if (!combo) return;
+    SetWindowTextW(combo, L"\u5207\u6362\u6b4c\u66f2\u64ad\u62a5\u5185\u5bb9");
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    for (const auto& item : g_announce_track_formats) {
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.name));
+    }
+    pfc::string8 id = cfg_announce_track_format.get();
+    SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(find_announce_track_format_index(id.get_ptr())), 0);
+}
+
+static void save_announce_track_format_combo(HWND wnd) {
+    HWND combo = GetDlgItem(wnd, IDC_ANNOUNCE_TRACK_FORMAT);
+    if (!combo) return;
+    int index = static_cast<int>(SendMessageW(combo, CB_GETCURSEL, 0, 0));
+    if (index < 0 || index >= static_cast<int>(_countof(g_announce_track_formats))) index = 0;
+    cfg_announce_track_format.set(g_announce_track_formats[index].id);
+}
+
 
 static void init_lrc_encoding_combo(HWND wnd) {
     HWND combo = GetDlgItem(wnd, IDC_LRC_ENCODING);
@@ -237,6 +278,11 @@ static std::vector<sapi_voice_info> g_sapi_voices;
 
 static const int k_general_page_controls[] = {
     IDC_AUTO_SPEAK,
+    IDC_ANNOUNCE_TRACK,
+    IDC_STATIC_ANNOUNCE_TRACK_FORMAT,
+    IDC_ANNOUNCE_TRACK_FORMAT,
+    IDC_STATIC_ANNOUNCE_TRACK_DELAY_MS,
+    IDC_ANNOUNCE_TRACK_DELAY_MS,
     IDC_STATIC_LRC_ENCODING,
     IDC_LRC_ENCODING,
     IDC_STATIC_LEAD,
@@ -450,6 +496,7 @@ static void set_dialog_dirty(HWND wnd, bool dirty) {
 static bool is_settings_edit_control(WORD id) {
     switch (id) {
     case IDC_LEAD_MS:
+    case IDC_ANNOUNCE_TRACK_DELAY_MS:
     case IDC_MISSING_LRC_RETRY_SECONDS:
     case IDC_LYRIC_VALID_MS:
     case IDC_LRC_FILE:
@@ -467,6 +514,16 @@ static void init_dialog(HWND wnd) {
     init_settings_tabs(wnd);
 
     CheckDlgButton(wnd, IDC_AUTO_SPEAK, cfg_auto_speak.get() ? BST_CHECKED : BST_UNCHECKED);
+
+    CheckDlgButton(wnd, IDC_ANNOUNCE_TRACK, cfg_announce_track_on_change.get() ? BST_CHECKED : BST_UNCHECKED);
+    SetWindowTextW(GetDlgItem(wnd, IDC_ANNOUNCE_TRACK), L"\u5207\u6362\u6b4c\u66f2\u65f6\u64ad\u62a5\u6b4c\u66f2\u4fe1\u606f");
+    SetWindowTextW(GetDlgItem(wnd, IDC_STATIC_ANNOUNCE_TRACK_FORMAT), L"\u5207\u6362\u6b4c\u66f2\u64ad\u62a5\u5185\u5bb9");
+    SetWindowTextW(GetDlgItem(wnd, IDC_STATIC_ANNOUNCE_TRACK_DELAY_MS), L"\u5207\u6362\u6b4c\u66f2\u64ad\u62a5\u5ef6\u8fdf\u6beb\u79d2");
+    init_announce_track_format_combo(wnd);
+    int announceDelayMs = static_cast<int>(cfg_announce_track_delay_ms.get());
+    if (announceDelayMs < 0) announceDelayMs = 0;
+    if (announceDelayMs > 10000) announceDelayMs = 10000;
+    SetDlgItemInt(wnd, IDC_ANNOUNCE_TRACK_DELAY_MS, static_cast<UINT>(announceDelayMs), FALSE);
 
     SetDlgItemInt(wnd, IDC_LEAD_MS, static_cast<UINT>(cfg_lead_ms.get()), TRUE);
 
@@ -510,6 +567,10 @@ static void save_dialog(HWND wnd) {
 
     int lead = static_cast<int>(GetDlgItemInt(wnd, IDC_LEAD_MS, &ok, TRUE));
 
+    BOOL announceDelayOk = FALSE;
+
+    int announceDelayMs = static_cast<int>(GetDlgItemInt(wnd, IDC_ANNOUNCE_TRACK_DELAY_MS, &announceDelayOk, FALSE));
+
     BOOL retryOk = FALSE;
 
     int retryMs = static_cast<int>(GetDlgItemInt(wnd, IDC_MISSING_LRC_RETRY_SECONDS, &retryOk, FALSE));
@@ -523,6 +584,17 @@ static void save_dialog(HWND wnd) {
     int deleteDelayMs = static_cast<int>(GetDlgItemInt(wnd, IDC_TEMP_LRC_DELETE_DELAY_MS, &deleteDelayOk, FALSE));
 
     cfg_auto_speak.set(IsDlgButtonChecked(wnd, IDC_AUTO_SPEAK) == BST_CHECKED);
+
+    cfg_announce_track_on_change.set(IsDlgButtonChecked(wnd, IDC_ANNOUNCE_TRACK) == BST_CHECKED);
+
+    save_announce_track_format_combo(wnd);
+
+    if (announceDelayOk && announceDelayMs > 0) {
+        if (announceDelayMs > 10000) announceDelayMs = 10000;
+        cfg_announce_track_delay_ms.set(static_cast<int64_t>(announceDelayMs));
+    } else {
+        cfg_announce_track_delay_ms.set(0);
+    }
 
     cfg_lead_ms.set(ok ? static_cast<int64_t>(lead) : 0);
 
@@ -601,12 +673,16 @@ static INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_AUTO_SPEAK && HIWORD(wp) == BN_CLICKED) {
             set_dialog_dirty(wnd, true);
+        } else if (LOWORD(wp) == IDC_ANNOUNCE_TRACK && HIWORD(wp) == BN_CLICKED) {
+            set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_DOWNLOAD_TO_LRC_FOLDER && HIWORD(wp) == BN_CLICKED) {
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_USE_SCREEN_READER && HIWORD(wp) == BN_CLICKED) {
             update_tts_detail_visibility(wnd);
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_LRC_ENCODING && HIWORD(wp) == CBN_SELCHANGE) {
+            set_dialog_dirty(wnd, true);
+        } else if (LOWORD(wp) == IDC_ANNOUNCE_TRACK_FORMAT && HIWORD(wp) == CBN_SELCHANGE) {
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_TTS_VOICE && HIWORD(wp) == CBN_SELCHANGE) {
             update_tts_test_text(wnd);

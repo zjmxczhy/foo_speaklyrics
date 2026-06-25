@@ -2,6 +2,9 @@
 #include "stdafx.h"
 
 extern cfg_var_modern::cfg_bool cfg_auto_speak;
+extern cfg_var_modern::cfg_bool cfg_announce_track_on_change;
+extern cfg_var_modern::cfg_string cfg_announce_track_format;
+extern cfg_var_modern::cfg_int cfg_announce_track_delay_ms;
 extern cfg_var_modern::cfg_int cfg_lead_ms;
 extern cfg_var_modern::cfg_int cfg_missing_lrc_retry_ms;
 extern cfg_var_modern::cfg_int cfg_lyric_valid_ms;

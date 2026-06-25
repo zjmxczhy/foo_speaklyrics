@@ -5,6 +5,7 @@
 #include "lrc_parser.h"
 #include "playback.h"
 #include "resource.h"
+#include "speech_engine.h"
 
 #include <cwctype>
 #include <windowsx.h>
@@ -13,6 +14,7 @@ namespace {
 
 HWND g_window = nullptr;
 HWND g_time_edit = nullptr;
+HWND g_refresh_time_button = nullptr;
 HWND g_text_edit = nullptr;
 HWND g_encoding_combo = nullptr;
 HWND g_preview_edit = nullptr;
@@ -79,6 +81,22 @@ std::wstring current_playback_lrc_time() {
 
 void refresh_time_edit() {
     if (g_time_edit) set_window_text_silent(g_time_edit, current_playback_lrc_time());
+}
+
+void refresh_time_edit_and_speak() {
+    HWND oldFocus = GetFocus();
+    refresh_time_edit();
+    std::wstring time = get_window_text(g_time_edit);
+    if (!time.empty() && time.front() == L'[' && time.back() == L']') {
+        time = time.substr(1, time.size() - 2);
+    }
+    std::wstring message = L"\u5f53\u524d\u65f6\u95f4";
+    if (!time.empty()) {
+        message += L" ";
+        message += time;
+    }
+    speech_queue_speak(message.c_str(), true);
+    if (oldFocus && IsWindow(oldFocus)) SetFocus(oldFocus);
 }
 
 void init_encoding_combo(const char* selected_id) {
@@ -258,6 +276,7 @@ void reset_handles(HWND wnd) {
     if (g_text_edit && IsWindow(g_text_edit)) RemoveWindowSubclass(g_text_edit, text_edit_proc, 1);
     g_window = nullptr;
     g_time_edit = nullptr;
+    g_refresh_time_button = nullptr;
     g_text_edit = nullptr;
     g_encoding_combo = nullptr;
     g_preview_edit = nullptr;
@@ -275,6 +294,7 @@ INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_INITDIALOG:
         g_window = wnd;
         g_time_edit = GetDlgItem(wnd, IDC_TIMESTAMP_TIME);
+        g_refresh_time_button = GetDlgItem(wnd, IDC_TIMESTAMP_REFRESH_TIME);
         g_text_edit = GetDlgItem(wnd, IDC_TIMESTAMP_TEXT);
         g_encoding_combo = GetDlgItem(wnd, IDC_TIMESTAMP_ENCODING);
         g_save_button = GetDlgItem(wnd, IDC_TIMESTAMP_SAVE);
@@ -284,6 +304,7 @@ INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_close_button = GetDlgItem(wnd, IDCANCEL);
         SetWindowTextW(wnd, L"\u6dfb\u52a0\u5f53\u524d\u65f6\u95f4\u6b4c\u8bcd");
         SetWindowTextW(GetDlgItem(wnd, IDC_STATIC_TIMESTAMP_TIME), L"\u5f53\u524d\u65f6\u95f4");
+        SetWindowTextW(g_refresh_time_button, L"\u5237\u65b0\u5f53\u524d\u65f6\u95f4(&T)");
         SetWindowTextW(GetDlgItem(wnd, IDC_STATIC_TIMESTAMP_TEXT), L"\u5f53\u524d\u65f6\u95f4\u6b4c\u8bcd");
         SetWindowTextW(GetDlgItem(wnd, IDC_STATIC_TIMESTAMP_ENCODING), L"\u7f16\u7801");
         SetWindowTextW(GetDlgItem(wnd, IDC_STATIC_TIMESTAMP_PREVIEW), L"\u9884\u89c8");
@@ -292,6 +313,7 @@ INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetWindowTextW(g_open_button, L"\u6253\u5f00(&O)");
         SetWindowTextW(g_close_button, L"\u5173\u95ed(&C)");
         set_accessible_name(g_time_edit, L"\u5f53\u524d\u65f6\u95f4");
+        set_accessible_name(g_refresh_time_button, L"\u5237\u65b0\u5f53\u524d\u65f6\u95f4");
         set_accessible_name(g_text_edit, L"\u5f53\u524d\u65f6\u95f4\u6b4c\u8bcd");
         set_accessible_name(g_encoding_combo, L"\u7f16\u7801");
         set_accessible_name(g_save_button, L"\u4fdd\u5b58");
@@ -310,6 +332,12 @@ INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             return TRUE;
         }
         switch (LOWORD(wp)) {
+        case IDC_TIMESTAMP_REFRESH_TIME:
+            if (HIWORD(wp) == BN_CLICKED) {
+                refresh_time_edit_and_speak();
+                return TRUE;
+            }
+            break;
         case IDC_TIMESTAMP_SAVE:
             if (HIWORD(wp) == BN_CLICKED) {
                 save_current(false);

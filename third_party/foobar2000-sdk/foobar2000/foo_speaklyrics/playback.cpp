@@ -30,6 +30,10 @@ std::wstring g_downloader_requested_track_key;
 
 std::wstring g_current_track_key;
 
+std::wstring g_pending_track_announce_text;
+
+ULONGLONG g_pending_track_announce_due_tick = 0;
+
 struct pending_temp_lrc_delete {
     std::wstring path;
     ULONGLONG due_tick = 0;
@@ -213,6 +217,106 @@ downloader_track_info get_downloader_track_info(metadb_handle_ptr track) {
 
     return out;
 
+}
+
+std::wstring trim_text(std::wstring text) {
+    while (!text.empty() && iswspace(text.front())) text.erase(text.begin());
+    while (!text.empty() && iswspace(text.back())) text.pop_back();
+    return text;
+}
+
+std::wstring fallback_track_path_text(metadb_handle_ptr track) {
+    if (track.is_empty()) return std::wstring();
+    return utf8_to_wide(track->get_path());
+}
+
+std::wstring track_file_name(metadb_handle_ptr track, bool withoutExtension) {
+    if (auto path = local_track_path(track)) {
+        fs::path file(*path);
+        return withoutExtension ? file.stem().wstring() : file.filename().wstring();
+    }
+    std::wstring pathText = fallback_track_path_text(track);
+    if (pathText.empty()) return std::wstring();
+    fs::path file(pathText);
+    std::wstring name = withoutExtension ? file.stem().wstring() : file.filename().wstring();
+    return name.empty() ? pathText : name;
+}
+
+std::wstring join_nonempty(const std::wstring& first, const std::wstring& second) {
+    std::wstring a = trim_text(first);
+    std::wstring b = trim_text(second);
+    if (!a.empty() && !b.empty()) return a + L"\uFF0C" + b;
+    if (!a.empty()) return a;
+    return b;
+}
+
+std::wstring announce_track_text(metadb_handle_ptr track) {
+    downloader_track_info info = get_downloader_track_info(track);
+    std::wstring title = trim_text(info.title);
+    std::wstring artist = trim_text(info.artist);
+
+    pfc::string8 formatCfg = cfg_announce_track_format.get();
+    std::string format = formatCfg.c_str();
+    std::transform(format.begin(), format.end(), format.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+    std::wstring text;
+    if (format == "title") {
+        text = title;
+    } else if (format == "artist_title") {
+        text = join_nonempty(artist, title);
+    } else if (format == "filename") {
+        text = track_file_name(track, false);
+    } else if (format == "filename_no_ext") {
+        text = track_file_name(track, true);
+    } else {
+        text = join_nonempty(title, artist);
+    }
+
+    if (trim_text(text).empty()) {
+        text = track_file_name(track, true);
+    }
+    if (trim_text(text).empty()) {
+        text = fallback_track_path_text(track);
+    }
+    return trim_text(text);
+}
+
+int announce_track_delay_ms() {
+    int delay = static_cast<int>(cfg_announce_track_delay_ms.get());
+    if (delay < 0) delay = 0;
+    if (delay > 10000) delay = 10000;
+    return delay;
+}
+
+bool queue_or_speak_track_announcement(metadb_handle_ptr track) {
+    g_pending_track_announce_text.clear();
+    g_pending_track_announce_due_tick = 0;
+    if (!cfg_announce_track_on_change.get() || track.is_empty()) return false;
+
+    std::wstring text = announce_track_text(track);
+    if (text.empty()) return false;
+
+    int delay = announce_track_delay_ms();
+    if (delay <= 0) {
+        speech_queue_speak(text.c_str(), true);
+    } else {
+        g_pending_track_announce_text = text;
+        g_pending_track_announce_due_tick = GetTickCount64() + static_cast<ULONGLONG>(delay);
+    }
+    return true;
+}
+
+void cancel_pending_track_announcement() {
+    g_pending_track_announce_text.clear();
+    g_pending_track_announce_due_tick = 0;
+}
+
+void process_pending_track_announcement() {
+    if (g_pending_track_announce_text.empty() || g_pending_track_announce_due_tick == 0) return;
+    if (GetTickCount64() < g_pending_track_announce_due_tick) return;
+    std::wstring text = g_pending_track_announce_text;
+    cancel_pending_track_announcement();
+    speech_queue_speak(text.c_str(), true);
 }
 
 
@@ -882,7 +986,9 @@ public:
 
         load_for_track(p_track);
 
-        speak_for_time(0);
+        bool announced = queue_or_speak_track_announcement(p_track);
+
+        if (!announced) speak_for_time(0);
 
     }
 
@@ -891,6 +997,8 @@ public:
         g_last_missing_lrc_retry_time = -1000.0;
 
         g_downloader_requested_track_key.clear();
+
+        cancel_pending_track_announcement();
 
         speech_queue_silence();
 
@@ -908,7 +1016,10 @@ public:
 
         g_paused = p_state;
 
-        if (p_state) speech_queue_silence();
+        if (p_state) {
+            cancel_pending_track_announcement();
+            speech_queue_silence();
+        }
 
     }
 
@@ -922,7 +1033,11 @@ public:
 
         process_pending_temp_lrc_deletes();
 
+        process_pending_track_announcement();
+
         retry_load_missing_lrc(p_time);
+
+        if (!g_pending_track_announce_text.empty()) return;
 
         speak_for_time(p_time);
 
