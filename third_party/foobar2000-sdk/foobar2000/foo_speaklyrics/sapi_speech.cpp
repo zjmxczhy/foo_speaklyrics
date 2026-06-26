@@ -89,12 +89,8 @@ ISpObjectToken* find_voice_token(const wchar_t* voiceType, const wchar_t* voiceI
     return token;
 }
 
-bool speak_with_new_voice_unsafe(const wchar_t* voiceType, const wchar_t* voiceId, int rate, const wchar_t* text, bool interrupt) {
-    if (!text || !*text) return true;
-
-    ISpVoice* voice = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_SpVoice, nullptr, CLSCTX_ALL, IID_ISpVoice, reinterpret_cast<void**>(&voice));
-    if (FAILED(hr) || !voice) return false;
+bool configure_voice_unsafe(ISpVoice* voice, const wchar_t* voiceType, const wchar_t* voiceId, int rate) {
+    if (!voice) return false;
 
     ISpObjectToken* token = find_voice_token(voiceType, voiceId);
     if (token) {
@@ -106,34 +102,36 @@ bool speak_with_new_voice_unsafe(const wchar_t* voiceType, const wchar_t* voiceI
     if (rate < -10) rate = -10;
     if (rate > 10) rate = 10;
     voice->SetRate(rate);
+    return true;
+}
 
-    DWORD flags = SPF_IS_NOT_XML;
+bool speak_with_voice_unsafe(ISpVoice* voice, const wchar_t* voiceType, const wchar_t* voiceId, int rate, const wchar_t* text, bool interrupt) {
+    if (!voice) return false;
+    if (!text || !*text) return true;
+
+    configure_voice_unsafe(voice, voiceType, voiceId, rate);
+
+    DWORD flags = SPF_IS_NOT_XML | SPF_ASYNC;
     if (interrupt) flags |= SPF_PURGEBEFORESPEAK;
-    hr = voice->Speak(text, flags, nullptr);
-    voice->Release();
+    HRESULT hr = voice->Speak(text, flags, nullptr);
     return SUCCEEDED(hr);
 }
 
-void purge_sapi_queue_unsafe() {
-    ISpVoice* voice = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_SpVoice, nullptr, CLSCTX_ALL, IID_ISpVoice, reinterpret_cast<void**>(&voice));
-    if (SUCCEEDED(hr) && voice) {
-        voice->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
-        voice->Release();
-    }
+void purge_sapi_queue_unsafe(ISpVoice* voice) {
+    if (voice) voice->Speak(nullptr, SPF_PURGEBEFORESPEAK | SPF_ASYNC, nullptr);
 }
 
-bool speak_with_new_voice(const wchar_t* voiceType, const wchar_t* voiceId, int rate, const wchar_t* text, bool interrupt) {
+bool speak_with_voice(ISpVoice* voice, const wchar_t* voiceType, const wchar_t* voiceId, int rate, const wchar_t* text, bool interrupt) {
     __try {
-        return speak_with_new_voice_unsafe(voiceType, voiceId, rate, text, interrupt);
+        return speak_with_voice_unsafe(voice, voiceType, voiceId, rate, text, interrupt);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
 
-void purge_sapi_queue() {
+void purge_sapi_queue(ISpVoice* voice) {
     __try {
-        purge_sapi_queue_unsafe();
+        purge_sapi_queue_unsafe(voice);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
@@ -141,6 +139,9 @@ void purge_sapi_queue() {
 DWORD WINAPI sapi_worker_proc(void*) {
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     bool coInitialized = SUCCEEDED(hrCo);
+    ISpVoice* voice = nullptr;
+    HRESULT hrVoice = CoCreateInstance(CLSID_SpVoice, nullptr, CLSCTX_ALL, IID_ISpVoice, reinterpret_cast<void**>(&voice));
+    if (FAILED(hrVoice)) voice = nullptr;
 
     for (;;) {
         WaitForSingleObject(g_sapi_event, INFINITE);
@@ -162,13 +163,14 @@ DWORD WINAPI sapi_worker_proc(void*) {
 
         if (quit) break;
         if (kind == sapi_task_silence) {
-            purge_sapi_queue();
+            purge_sapi_queue(voice);
         } else if (kind == sapi_task_speak && !text.empty()) {
-            speak_with_new_voice(type.c_str(), voiceId.c_str(), rate, text.c_str(), interrupt);
+            speak_with_voice(voice, type.c_str(), voiceId.c_str(), rate, text.c_str(), interrupt);
         }
     }
 
-    purge_sapi_queue();
+    purge_sapi_queue(voice);
+    if (voice) voice->Release();
     if (coInitialized) CoUninitialize();
     return 0;
 }
