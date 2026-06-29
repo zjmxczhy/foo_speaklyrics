@@ -14,7 +14,7 @@
 
 
 
-static std::wstring cfg_to_wide(cfg_var_modern::cfg_string& s) {
+static std::wstring cfg_to_wide(cfg_string& s) {
 
     pfc::string8 v = s.get();
 
@@ -24,11 +24,11 @@ static std::wstring cfg_to_wide(cfg_var_modern::cfg_string& s) {
 
 
 
-static void set_cfg_from_wide(cfg_var_modern::cfg_string& s, const std::wstring& v) {
+static void set_cfg_from_wide(cfg_string& s, const std::wstring& v) {
 
     pfc::string8 utf8 = pfc::stringcvt::string_utf8_from_wide(v.c_str()).get_ptr();
 
-    s.set(utf8);
+    s.set(utf8.get_ptr());
 
 }
 
@@ -258,7 +258,7 @@ static void save_source_list(HWND wnd) {
             csv << g_lyric_sources[i].id;
         }
     }
-    cfg_lyric_sources.set(csv);
+    cfg_lyric_sources.set(csv.get_ptr());
 }
 
 
@@ -291,6 +291,9 @@ static const int k_general_page_controls[] = {
     IDC_MISSING_LRC_RETRY_SECONDS,
     IDC_STATIC_LYRIC_VALID_MS,
     IDC_LYRIC_VALID_MS,
+    IDC_HIDE_MAIN_WINDOW_ON_STARTUP,
+    IDC_STATIC_HIDE_MAIN_WINDOW_DELAY_MS,
+    IDC_HIDE_MAIN_WINDOW_DELAY_MS,
 };
 
 static const int k_lyrics_page_controls[] = {
@@ -499,6 +502,7 @@ static bool is_settings_edit_control(WORD id) {
     case IDC_ANNOUNCE_TRACK_DELAY_MS:
     case IDC_MISSING_LRC_RETRY_SECONDS:
     case IDC_LYRIC_VALID_MS:
+    case IDC_HIDE_MAIN_WINDOW_DELAY_MS:
     case IDC_LRC_FILE:
     case IDC_LRC_FOLDER:
     case IDC_TEMP_LRC_FOLDER:
@@ -533,6 +537,14 @@ static void init_dialog(HWND wnd) {
     SetDlgItemInt(wnd, IDC_MISSING_LRC_RETRY_SECONDS, static_cast<UINT>(retryMs), FALSE);
 
     SetDlgItemInt(wnd, IDC_LYRIC_VALID_MS, static_cast<UINT>(cfg_lyric_valid_ms.get()), FALSE);
+
+    CheckDlgButton(wnd, IDC_HIDE_MAIN_WINDOW_ON_STARTUP, cfg_hide_main_window_on_startup.get() ? BST_CHECKED : BST_UNCHECKED);
+    SetWindowTextW(GetDlgItem(wnd, IDC_HIDE_MAIN_WINDOW_ON_STARTUP), L"\u542f\u52a8\u540e\u9690\u85cf foobar2000 \u4e3b\u7a97\u53e3");
+    SetWindowTextW(GetDlgItem(wnd, IDC_STATIC_HIDE_MAIN_WINDOW_DELAY_MS), L"\u542f\u52a8\u540e\u9690\u85cf\u4e3b\u7a97\u53e3\u5ef6\u8fdf\u6beb\u79d2");
+    int hideDelayMs = static_cast<int>(cfg_hide_main_window_delay_ms.get());
+    if (hideDelayMs < 0) hideDelayMs = 0;
+    if (hideDelayMs > 10000) hideDelayMs = 10000;
+    SetDlgItemInt(wnd, IDC_HIDE_MAIN_WINDOW_DELAY_MS, static_cast<UINT>(hideDelayMs), FALSE);
 
     SetDlgItemTextW(wnd, IDC_LRC_FILE, L"");
 
@@ -579,40 +591,53 @@ static void save_dialog(HWND wnd) {
 
     int validMs = static_cast<int>(GetDlgItemInt(wnd, IDC_LYRIC_VALID_MS, &validOk, FALSE));
 
+    BOOL hideDelayOk = FALSE;
+
+    int hideDelayMs = static_cast<int>(GetDlgItemInt(wnd, IDC_HIDE_MAIN_WINDOW_DELAY_MS, &hideDelayOk, FALSE));
+
     BOOL deleteDelayOk = FALSE;
 
     int deleteDelayMs = static_cast<int>(GetDlgItemInt(wnd, IDC_TEMP_LRC_DELETE_DELAY_MS, &deleteDelayOk, FALSE));
 
-    cfg_auto_speak.set(IsDlgButtonChecked(wnd, IDC_AUTO_SPEAK) == BST_CHECKED);
+    cfg_auto_speak = (IsDlgButtonChecked(wnd, IDC_AUTO_SPEAK) == BST_CHECKED);
 
-    cfg_announce_track_on_change.set(IsDlgButtonChecked(wnd, IDC_ANNOUNCE_TRACK) == BST_CHECKED);
+    cfg_announce_track_on_change = (IsDlgButtonChecked(wnd, IDC_ANNOUNCE_TRACK) == BST_CHECKED);
 
     save_announce_track_format_combo(wnd);
 
     if (announceDelayOk && announceDelayMs > 0) {
         if (announceDelayMs > 10000) announceDelayMs = 10000;
-        cfg_announce_track_delay_ms.set(static_cast<int64_t>(announceDelayMs));
+        cfg_announce_track_delay_ms = announceDelayMs;
     } else {
-        cfg_announce_track_delay_ms.set(0);
+        cfg_announce_track_delay_ms = 0;
     }
 
-    cfg_lead_ms.set(ok ? static_cast<int64_t>(lead) : 0);
+    cfg_lead_ms = ok ? static_cast<int>(lead) : 0;
 
     if (retryOk && retryMs > 0) {
         if (retryMs < 500) retryMs = 500;
         if (retryMs > 600000) retryMs = 600000;
-        cfg_missing_lrc_retry_ms.set(static_cast<int64_t>(retryMs));
+        cfg_missing_lrc_retry_ms = retryMs;
     } else {
-        cfg_missing_lrc_retry_ms.set(3000);
+        cfg_missing_lrc_retry_ms = 3000;
     }
 
-    cfg_lyric_valid_ms.set((validOk && validMs > 0) ? static_cast<int64_t>(validMs) : 3000);
+    cfg_lyric_valid_ms = (validOk && validMs > 0) ? validMs : 3000;
+
+    cfg_hide_main_window_on_startup = (IsDlgButtonChecked(wnd, IDC_HIDE_MAIN_WINDOW_ON_STARTUP) == BST_CHECKED);
+
+    if (hideDelayOk && hideDelayMs >= 0) {
+        if (hideDelayMs > 10000) hideDelayMs = 10000;
+        cfg_hide_main_window_delay_ms = hideDelayMs;
+    } else {
+        cfg_hide_main_window_delay_ms = 800;
+    }
 
     if (deleteDelayOk && deleteDelayMs > 0) {
         if (deleteDelayMs > 600000) deleteDelayMs = 600000;
-        cfg_temp_lrc_delete_delay_ms.set(static_cast<int64_t>(deleteDelayMs));
+        cfg_temp_lrc_delete_delay_ms = deleteDelayMs;
     } else {
-        cfg_temp_lrc_delete_delay_ms.set(0);
+        cfg_temp_lrc_delete_delay_ms = 0;
     }
 
     std::wstring lrcFile = get_dlg_text(wnd, IDC_LRC_FILE);
@@ -633,15 +658,15 @@ static void save_dialog(HWND wnd) {
 
     save_source_list(wnd);
 
-    cfg_download_to_lrc_folder.set(IsDlgButtonChecked(wnd, IDC_DOWNLOAD_TO_LRC_FOLDER) == BST_CHECKED);
+    cfg_download_to_lrc_folder = (IsDlgButtonChecked(wnd, IDC_DOWNLOAD_TO_LRC_FOLDER) == BST_CHECKED);
 
-    cfg_use_screen_reader.set(IsDlgButtonChecked(wnd, IDC_USE_SCREEN_READER) == BST_CHECKED);
+    cfg_use_screen_reader = (IsDlgButtonChecked(wnd, IDC_USE_SCREEN_READER) == BST_CHECKED);
 
     cfg_tts_voice_type.set("sapi5");
 
     set_cfg_from_wide(cfg_tts_voice_id, current_tts_voice_id(wnd));
 
-    cfg_tts_rate.set(static_cast<int64_t>(current_tts_rate(wnd)));
+    cfg_tts_rate = current_tts_rate(wnd);
 
 }
 
@@ -674,6 +699,8 @@ static INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (LOWORD(wp) == IDC_AUTO_SPEAK && HIWORD(wp) == BN_CLICKED) {
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_ANNOUNCE_TRACK && HIWORD(wp) == BN_CLICKED) {
+            set_dialog_dirty(wnd, true);
+        } else if (LOWORD(wp) == IDC_HIDE_MAIN_WINDOW_ON_STARTUP && HIWORD(wp) == BN_CLICKED) {
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_DOWNLOAD_TO_LRC_FOLDER && HIWORD(wp) == BN_CLICKED) {
             set_dialog_dirty(wnd, true);

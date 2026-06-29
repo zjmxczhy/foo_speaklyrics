@@ -6,6 +6,8 @@ static const GUID guid_cfg_auto_speak = { 0x84c160de, 0xfd7a, 0x4dc9,{ 0x97, 0xf
 static const GUID guid_cfg_announce_track_on_change = { 0x0f49fb33, 0x6d57, 0x4b78,{ 0x8d, 0x22, 0x82, 0x29, 0x57, 0xdb, 0x5d, 0xa1 } };
 static const GUID guid_cfg_announce_track_format = { 0x59440367, 0x7f9a, 0x4057,{ 0x84, 0x76, 0x7c, 0x44, 0x77, 0x8a, 0xa4, 0x26 } };
 static const GUID guid_cfg_announce_track_delay_ms = { 0xb1abbb64, 0x6f32, 0x4f2b,{ 0x92, 0x1a, 0x77, 0x7e, 0x42, 0xa4, 0x29, 0xa0 } };
+static const GUID guid_cfg_hide_main_window_on_startup = { 0x4fcd85ac, 0xa7f2, 0x4fa8,{ 0x80, 0xe3, 0x06, 0xef, 0x3d, 0x4e, 0x2b, 0x7a } };
+static const GUID guid_cfg_hide_main_window_delay_ms = { 0x3a6a84f3, 0xe32e, 0x44b8,{ 0xa8, 0x91, 0x6d, 0x5b, 0xa4, 0xb9, 0x11, 0x3e } };
 static const GUID guid_cfg_lead_ms = { 0x1c073b2c, 0xed7b, 0x4e41,{ 0xa2, 0x4f, 0xcb, 0x9, 0xda, 0xe4, 0xc2, 0x11 } };
 static const GUID guid_cfg_missing_lrc_retry_ms = { 0x4db3f214, 0x9909, 0x47d0,{ 0x86, 0x38, 0x7d, 0x92, 0x7b, 0x88, 0x51, 0x3a } };
 static const GUID guid_cfg_lyric_valid_ms = { 0xa7f36b55, 0x7744, 0x4e25,{ 0x8c, 0x71, 0x23, 0x39, 0x7f, 0x3e, 0xe8, 0x2d } };
@@ -21,24 +23,26 @@ static const GUID guid_cfg_tts_voice_type = { 0x25e6539b, 0x63c8, 0x487b,{ 0x9d,
 static const GUID guid_cfg_tts_voice_id = { 0xe6ab9ec3, 0x7995, 0x4882,{ 0x82, 0x4c, 0xae, 0x4f, 0x66, 0x9d, 0xc5, 0x92 } };
 static const GUID guid_cfg_tts_rate = { 0xddd95cd8, 0x8cc0, 0x4f15,{ 0xb4, 0x55, 0x92, 0x35, 0x3c, 0x20, 0xfb, 0x69 } };
 
-cfg_var_modern::cfg_bool cfg_auto_speak(guid_cfg_auto_speak, false);
-cfg_var_modern::cfg_bool cfg_announce_track_on_change(guid_cfg_announce_track_on_change, false);
-cfg_var_modern::cfg_string cfg_announce_track_format(guid_cfg_announce_track_format, "title_artist");
-cfg_var_modern::cfg_int cfg_announce_track_delay_ms(guid_cfg_announce_track_delay_ms, 0);
-cfg_var_modern::cfg_int cfg_lead_ms(guid_cfg_lead_ms, 0);
-cfg_var_modern::cfg_int cfg_missing_lrc_retry_ms(guid_cfg_missing_lrc_retry_ms, 3000);
-cfg_var_modern::cfg_int cfg_lyric_valid_ms(guid_cfg_lyric_valid_ms, 3000);
-cfg_var_modern::cfg_int cfg_temp_lrc_delete_delay_ms(guid_cfg_temp_lrc_delete_delay_ms, 0);
-cfg_var_modern::cfg_string cfg_lrc_file(guid_cfg_lrc_file, "");
-cfg_var_modern::cfg_string cfg_lrc_folder(guid_cfg_lrc_folder, "");
-cfg_var_modern::cfg_string cfg_temp_lrc_folder(guid_cfg_temp_lrc_folder, "%Temp%");
-cfg_var_modern::cfg_string cfg_lyric_sources(guid_cfg_lyric_sources, "lrclib,qq1");
-cfg_var_modern::cfg_string cfg_lrc_encoding(guid_cfg_lrc_encoding, "auto");
-cfg_var_modern::cfg_bool cfg_download_to_lrc_folder(guid_cfg_download_to_lrc_folder, false);
-cfg_var_modern::cfg_bool cfg_use_screen_reader(guid_cfg_use_screen_reader, true);
-cfg_var_modern::cfg_string cfg_tts_voice_type(guid_cfg_tts_voice_type, "sapi5");
-cfg_var_modern::cfg_string cfg_tts_voice_id(guid_cfg_tts_voice_id, "");
-cfg_var_modern::cfg_int cfg_tts_rate(guid_cfg_tts_rate, 0);
+cfg_bool cfg_auto_speak(guid_cfg_auto_speak, false);
+cfg_bool cfg_announce_track_on_change(guid_cfg_announce_track_on_change, false);
+cfg_string cfg_announce_track_format(guid_cfg_announce_track_format, "title_artist");
+cfg_int cfg_announce_track_delay_ms(guid_cfg_announce_track_delay_ms, 0);
+cfg_bool cfg_hide_main_window_on_startup(guid_cfg_hide_main_window_on_startup, false);
+cfg_int cfg_hide_main_window_delay_ms(guid_cfg_hide_main_window_delay_ms, 800);
+cfg_int cfg_lead_ms(guid_cfg_lead_ms, 0);
+cfg_int cfg_missing_lrc_retry_ms(guid_cfg_missing_lrc_retry_ms, 3000);
+cfg_int cfg_lyric_valid_ms(guid_cfg_lyric_valid_ms, 3000);
+cfg_int cfg_temp_lrc_delete_delay_ms(guid_cfg_temp_lrc_delete_delay_ms, 0);
+cfg_string cfg_lrc_file(guid_cfg_lrc_file, "");
+cfg_string cfg_lrc_folder(guid_cfg_lrc_folder, "");
+cfg_string cfg_temp_lrc_folder(guid_cfg_temp_lrc_folder, "%Temp%");
+cfg_string cfg_lyric_sources(guid_cfg_lyric_sources, "lrclib,qq1");
+cfg_string cfg_lrc_encoding(guid_cfg_lrc_encoding, "auto");
+cfg_bool cfg_download_to_lrc_folder(guid_cfg_download_to_lrc_folder, false);
+cfg_bool cfg_use_screen_reader(guid_cfg_use_screen_reader, true);
+cfg_string cfg_tts_voice_type(guid_cfg_tts_voice_type, "sapi5");
+cfg_string cfg_tts_voice_id(guid_cfg_tts_voice_id, "");
+cfg_int cfg_tts_rate(guid_cfg_tts_rate, 0);
 
 std::wstring expand_environment_path(const std::wstring& path) {
     if (path.empty()) return path;

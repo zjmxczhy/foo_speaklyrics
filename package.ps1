@@ -40,6 +40,7 @@ function Copy-Payload($TargetDir, $ArchName, $ComponentPlatform) {
 New-Item -ItemType Directory -Force -Path $DistRoot | Out-Null
 Remove-Item -Recurse -Force `
     (Join-Path $DistRoot "foo_speaklyrics"), `
+    (Join-Path $DistRoot "foo_speaklyrics-fb2k1x-x86"), `
     (Join-Path $DistRoot "foo_speaklyrics-x64"), `
     (Join-Path $DistRoot "foo_speaklyrics-x86"), `
     (Join-Path $DistRoot "foo_speaklyrics-package") `
@@ -47,6 +48,8 @@ Remove-Item -Recurse -Force `
 Remove-Item -Force `
     (Join-Path $DistRoot "foo_speaklyrics.fb2k-component"), `
     (Join-Path $DistRoot "foo_speaklyrics.zip"), `
+    (Join-Path $DistRoot "foo_speaklyrics-fb2k1x-x86.fb2k-component"), `
+    (Join-Path $DistRoot "foo_speaklyrics-fb2k1x-x86.zip"), `
     (Join-Path $DistRoot "foo_speaklyrics-x64.fb2k-component"), `
     (Join-Path $DistRoot "foo_speaklyrics-x86.fb2k-component"), `
     (Join-Path $DistRoot "foo_speaklyrics-x64.zip"), `
@@ -64,7 +67,8 @@ Copy-Payload $ManualX86 "x86" "Win32"
 Compress-Archive -Path (Join-Path $ManualX86 "*") -DestinationPath (Join-Path $DistRoot "foo_speaklyrics-x86.zip")
 Move-Item (Join-Path $DistRoot "foo_speaklyrics-x86.zip") (Join-Path $DistRoot "foo_speaklyrics-x86.fb2k-component") -Force
 
-# Combined foobar2000 package: root is legacy x86, x64 folder is x64 override.
+# foobar2000 1.5 / 1.6 are x86-only in this packaging flow.
+# Combined foobar2000 package: root is x86, x64 folder is x64 override.
 $PackageDir = Join-Path $DistRoot "foo_speaklyrics-package"
 Copy-Payload $PackageDir "x86" "Win32"
 Copy-Payload (Join-Path $PackageDir "x64") "x64" "x64"

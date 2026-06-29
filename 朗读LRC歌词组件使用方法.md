@@ -2,7 +2,7 @@
 
 组件名称：**朗读 LRC 歌词**  
 组件文件名：`foo_speaklyrics.dll`  
-适用软件：foobar2000 2.1 及以上。
+适用软件：foobar2000 1.5/1.6 x86、foobar2000 2.x x86、foobar2000 2.x x64。
 主要用途：在播放歌曲时读取 LRC 歌词，并通过屏幕阅读器/Tolk 或 SAPI5.1 朗读当前歌词。
 
 ---
@@ -23,6 +23,7 @@
 10. 支持添加当前时间歌词，用于手动制作或补全 LRC 歌词。
 11. 支持通过 Tolk 调用屏幕阅读器朗读歌词。
 12. 支持在没有使用屏幕阅读器时改用 SAPI5.1 语音朗读。
+13. 支持启动后自动隐藏 foobar2000 主窗口，减少首次启动托盘模式下的幽灵窗口。
 
 ---
 
@@ -32,13 +33,27 @@
 如果你使用的是 64 位 foobar2000便携版，组件目录通常是：
 Foobar2000\user-components-x64\foo_speaklyrics
 
+64 位组件包适用于 foobar2000 2.x x64：
+foo_speaklyrics-x64.fb2k-component
+
 ### 2.2 x86 版 foobar2000
 如果你使用的是 32 位 foobar2000便携版，组件目录通常是：
 foobar2000\user-components\foo_speaklyrics
 
+x86 组件包是通用 x86 包，适用于 foobar2000 1.5/1.6 x86 和 foobar2000 2.x x86：
+foo_speaklyrics-x86.fb2k-component
+
 ### 2.3 使用组件安装包安装
+常用安装包包括：
 foo_speaklyrics-x64.fb2k-component
 foo_speaklyrics-x86.fb2k-component
+foo_speaklyrics.fb2k-component
+
+说明：
+- `foo_speaklyrics-x86.fb2k-component`：用于 32 位 foobar2000，兼容 1.5/1.6 x86 和 2.x x86。
+- `foo_speaklyrics-x64.fb2k-component`：用于 64 位 foobar2000 2.x。
+- `foo_speaklyrics.fb2k-component`：合并包，根目录是 x86，`x64` 子目录是 x64。
+
 可以在 foobar2000 里打开：
 文件 -> 参数选项 -> 组件
 然后选择安装组件包。
@@ -81,7 +96,7 @@ foo_speaklyrics-x86.fb2k-component
 
 ### 4.1 常规设置
 
-常规设置里放的是朗读、扫描和切换歌曲播报相关的基础选项。
+常规设置里放的是朗读、扫描、启动隐藏和切换歌曲播报相关的基础选项。
 
 #### 4.1.1 自动朗读
 
@@ -202,6 +217,27 @@ LRC朗读已关闭
 1000
 表示切歌后延迟 1 秒播报。
 
+#### 4.1.9 启动后隐藏主窗口
+
+用于解决 foobar2000 首次启动后，托盘模式下读屏仍能读到主窗口标题的幽灵窗口问题。
+
+- 选中：组件启动后会延迟调用 foobar2000 的隐藏主窗口命令。
+- 未选中：不处理启动后的主窗口隐藏。
+
+默认未选中。
+
+#### 4.1.10 启动后隐藏延迟毫秒
+
+用于控制首次启动后多久隐藏主窗口。
+
+默认值：
+800
+
+如果首次启动后仍能短暂读到幽灵窗口，可以尝试改成：
+1500
+或
+2000
+
 ---
 
 ### 4.2 LRC歌词
@@ -297,7 +333,7 @@ TTS语音选项卡用于选择歌词朗读输出方式。
 
 #### 4.3.1 使用屏幕阅读器
 
-默认选中。
+默认未选中。
 
 选中时，组件使用 Tolk 调用屏幕阅读器朗读歌词，例如争渡、NVDA 等。  
 选中时，不显示 SAPI5.1 的语音选择、语速和试听控件。

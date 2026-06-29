@@ -61,7 +61,7 @@ std::wstring utf8_to_wide(const char* s) {
 
 
 
-std::wstring cfg_path_wide(cfg_var_modern::cfg_string& var) {
+std::wstring cfg_path_wide(cfg_string& var) {
 
     return expand_environment_path(utf8_to_wide(var.get().c_str()));
 

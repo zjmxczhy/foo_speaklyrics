@@ -79,7 +79,7 @@ pfc::string8 wide_to_pfc_utf8(const std::wstring& value) {
     return pfc::stringcvt::string_utf8_from_wide(value.c_str()).get_ptr();
 }
 
-std::wstring cfg_to_wide_local(cfg_var_modern::cfg_string& s) {
+std::wstring cfg_to_wide_local(cfg_string& s) {
     pfc::string8 v = s.get();
     return pfc::stringcvt::string_wide_from_utf8(v).get_ptr();
 }

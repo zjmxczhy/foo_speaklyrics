@@ -175,7 +175,7 @@ public:
 
             bool enabled = !cfg_auto_speak.get();
 
-            cfg_auto_speak.set(enabled);
+            cfg_auto_speak = enabled;
 
             speech_queue_speak(enabled ? L"LRC\u6717\u8bfb\u5df2\u6253\u5f00" : L"LRC\u6717\u8bfb\u5df2\u5173\u95ed", true);
 
@@ -203,7 +203,7 @@ public:
 
             if (browse_lrc_folder(parent, path)) {
 
-                cfg_lrc_folder.set(path);
+                cfg_lrc_folder.set(path.get_ptr());
 
                 reload_current_lyrics();
 
@@ -219,7 +219,7 @@ public:
 
             if (browse_temp_lrc_folder(parent, path)) {
 
-                cfg_temp_lrc_folder.set(path);
+                cfg_temp_lrc_folder.set(path.get_ptr());
 
                 reload_current_lyrics();
 

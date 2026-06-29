@@ -5,7 +5,7 @@
 #include "sapi_speech.h"
 #include "tolk_bridge.h"
 
-static std::wstring cfg_to_wide_speech(cfg_var_modern::cfg_string& s) {
+static std::wstring cfg_to_wide_speech(cfg_string& s) {
     pfc::string8 v = s.get();
     return pfc::stringcvt::string_wide_from_utf8(v).get_ptr();
 }
