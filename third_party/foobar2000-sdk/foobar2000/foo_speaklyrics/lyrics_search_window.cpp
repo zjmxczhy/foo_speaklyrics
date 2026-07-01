@@ -5,6 +5,7 @@
 #include "playback.h"
 #include "resource.h"
 #include "speech_engine.h"
+#include "speaklyrics_log.h"
 
 #include <cwctype>
 #include <sstream>
@@ -278,6 +279,7 @@ bool download_item_to_folder(const search_result_item& item, const std::wstring&
     if (item.placeholder) return false;
     if (trim_text(folder).empty()) {
         error = L"\u6CA1\u6709\u8BBE\u7F6ELRC\u6B4C\u8BCD\u76EE\u5F55";
+        speaklyrics_log_error(L"手动搜索下载：没有设置输出目录。");
         return false;
     }
     std::error_code ec;
@@ -285,6 +287,7 @@ bool download_item_to_folder(const search_result_item& item, const std::wstring&
     fs::path exe = downloader_path();
     if (!fs::exists(exe, ec)) {
         error = L"\u627E\u4E0D\u5230\u6B4C\u8BCD\u4E0B\u8F7D\u5668";
+        speaklyrics_log_error(L"手动搜索下载：找不到歌词下载器：%s。", exe.c_str());
         return false;
     }
     std::wstring source = item.source_key.empty() ? cfg_to_wide_local(cfg_lyric_sources) : item.source_key;
@@ -299,8 +302,10 @@ bool download_item_to_folder(const search_result_item& item, const std::wstring&
     bool ok = run_process_capture_stdout(cmd, exe.parent_path(), output, code);
     if (!ok || code != 0) {
         error = L"\u6B4C\u8BCD\u4E0B\u8F7D\u5931\u8D25";
+        speaklyrics_log_error(L"手动搜索下载：下载失败，退出码：%lu，标题：%s，艺术家：%s。", code, item.title.c_str(), item.artist.c_str());
         return false;
     }
+    speaklyrics_log_info(L"手动搜索下载：下载成功，标题：%s，艺术家：%s，目录：%s。", item.title.c_str(), item.artist.c_str(), folder.c_str());
     return true;
 }
 
@@ -333,6 +338,7 @@ void auto_fill_current_playing() {
 void start_search() {
     if (g_searching) return;
     if (!has_enabled_sources()) {
+        speaklyrics_log_warning(L"手动搜索：没有启用歌词下载来源。");
         popup_message::g_show("\xE6\xB2\xA1\xE6\x9C\x89\xE5\x90\xAF\xE7\x94\xA8\xE6\xAD\x8C\xE8\xAF\x8D\xE4\xB8\x8B\xE8\xBD\xBD\xE6\x9D\xA5\xE6\xBA\x90", "\xE6\x90\x9C\xE7\xB4\xA2lrc\xE6\xAD\x8C\xE8\xAF\x8D");
         speech_queue_speak(L"\u6CA1\u6709\u542F\u7528\u6B4C\u8BCD\u4E0B\u8F7D\u6765\u6E90", true);
         return;
@@ -340,6 +346,7 @@ void start_search() {
     std::wstring title = trim_text(get_window_text(g_title_edit));
     std::wstring artist = trim_text(get_window_text(g_artist_edit));
     if (title.empty()) {
+        speaklyrics_log_warning(L"手动搜索：标题为空。");
         popup_message::g_show("\xE8\xAF\xB7\xE5\x85\x88\xE5\xA1\xAB\xE5\x86\x99\xE6\xA0\x87\xE9\xA2\x98", "\xE6\x90\x9C\xE7\xB4\xA2lrc\xE6\xAD\x8C\xE8\xAF\x8D");
         if (g_title_edit) SetFocus(g_title_edit);
         return;
@@ -352,9 +359,11 @@ void start_search() {
     std::wstring sources = cfg_to_wide_local(cfg_lyric_sources);
     fs::path exe = downloader_path();
     if (!fs::exists(exe)) {
+        speaklyrics_log_error(L"手动搜索：找不到歌词下载器：%s。", exe.c_str());
         popup_message::g_show("\xE6\x89\xBE\xE4\xB8\x8D\xE5\x88\xB0\xE6\xAD\x8C\xE8\xAF\x8D\xE4\xB8\x8B\xE8\xBD\xBD\xE5\x99\xA8", "\xE6\x90\x9C\xE7\xB4\xA2lrc\xE6\xAD\x8C\xE8\xAF\x8D");
         return;
     }
+    speaklyrics_log_info(L"手动搜索：开始搜索，标题：%s，艺术家：%s，来源：%s。", title.c_str(), fallbackArtist.c_str(), sources.c_str());
     set_searching(true);
     std::wstring command = command_line_quote(exe.wstring()) +
         L" --list --title " + command_line_quote(title) +

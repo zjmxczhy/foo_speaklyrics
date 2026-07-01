@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "tolk_bridge.h"
+#include "speaklyrics_log.h"
 
 namespace {
 using Tolk_Load_t = void(__cdecl*)();
@@ -90,7 +91,10 @@ bool ensure_loaded() {
     if (!path.empty()) path += L"\\Tolk.dll";
     g_tolk = LoadLibraryW(path.empty() ? L"Tolk.dll" : path.c_str());
     if (!g_tolk) g_tolk = LoadLibraryW(L"Tolk.dll");
-    if (!g_tolk) return false;
+    if (!g_tolk) {
+        speaklyrics_log_error(L"Tolk：无法加载 Tolk.dll，路径：%s，错误码：%lu。", path.c_str(), GetLastError());
+        return false;
+    }
 
     pLoad = reinterpret_cast<Tolk_Load_t>(GetProcAddress(g_tolk, "Tolk_Load"));
     pUnload = reinterpret_cast<Tolk_Unload_t>(GetProcAddress(g_tolk, "Tolk_Unload"));
@@ -99,6 +103,7 @@ bool ensure_loaded() {
     pSpeak = reinterpret_cast<Tolk_Speak_t>(GetProcAddress(g_tolk, "Tolk_Speak"));
     pSilence = reinterpret_cast<Tolk_Silence_t>(GetProcAddress(g_tolk, "Tolk_Silence"));
     if (!pLoad || !pUnload || (!pSpeak && !pOutput)) {
+        speaklyrics_log_error(L"Tolk：Tolk.dll 缺少必要导出函数。");
         FreeLibrary(g_tolk);
         g_tolk = nullptr;
         pLoad = nullptr;
@@ -111,6 +116,7 @@ bool ensure_loaded() {
     }
     safe_try_sapi(pTrySAPI, false);
     if (!safe_load(pLoad)) {
+        speaklyrics_log_error(L"Tolk：Tolk_Load 调用失败，可能是读屏驱动或 Tolk 依赖异常。");
         // Avoid FreeLibrary after Tolk_Load may have partially run: some drivers
         // crash during unload. The process will reclaim the module on exit.
         pLoad = nullptr;
@@ -122,6 +128,7 @@ bool ensure_loaded() {
         return false;
     }
     g_loaded = true;
+    speaklyrics_log_info(L"Tolk：加载成功。");
     return true;
 }
 
@@ -134,6 +141,7 @@ bool speak_direct(const wchar_t* text, bool interrupt) {
         if (ok) {
             ok = safe_text_call(pSpeak, text, interrupt);
             if (!ok) ok = safe_text_call(pOutput, text, interrupt);
+            if (!ok) speaklyrics_log_warning(L"Tolk：朗读调用失败。");
         }
     }
     LeaveCriticalSection(&g_tolk_lock);

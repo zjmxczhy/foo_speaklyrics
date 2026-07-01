@@ -183,6 +183,7 @@
     <ClCompile Include="playback.cpp" />
     <ClCompile Include="settings_dialog.cpp" />
     <ClCompile Include="sapi_speech.cpp" />
+    <ClCompile Include="speaklyrics_log.cpp" />
     <ClCompile Include="speech_engine.cpp" />
     <ClCompile Include="tolk_bridge.cpp" />
   </ItemGroup>
@@ -195,6 +196,7 @@
     <ClInclude Include="playback.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="sapi_speech.h" />
+    <ClInclude Include="speaklyrics_log.h" />
     <ClInclude Include="speech_engine.h" />
     <ClInclude Include="stdafx.h" />
     <ClInclude Include="tolk_bridge.h" />

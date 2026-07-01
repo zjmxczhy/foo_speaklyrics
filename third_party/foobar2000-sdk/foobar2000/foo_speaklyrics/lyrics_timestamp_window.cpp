@@ -6,6 +6,7 @@
 #include "playback.h"
 #include "resource.h"
 #include "speech_engine.h"
+#include "speaklyrics_log.h"
 
 #include <cwctype>
 #include <windowsx.h>
@@ -181,9 +182,11 @@ bool save_to_path(const std::wstring& path) {
     if (!lrc_write_text_file(path, get_window_text(g_preview_edit), selected_encoding_id(), error)) {
         std::wstring message = pfc::stringcvt::string_wide_from_utf8(error.get_ptr()).get_ptr();
         if (message.empty()) message = L"\u4fdd\u5b58 LRC \u6587\u4ef6\u5931\u8d25\u3002";
+        speaklyrics_log_error(L"添加当前时间歌词：保存失败：%s，文件：%s。", message.c_str(), path.c_str());
         show_error(message.c_str());
         return false;
     }
+    speaklyrics_log_info(L"添加当前时间歌词：保存成功：%s。", path.c_str());
     g_current_path = path;
     set_dirty(false);
     return true;
@@ -216,6 +219,7 @@ void open_lrc_file() {
     std::wstring text = lrc_read_text_file_auto(path, &detected, error);
     if (error.length() > 0) {
         std::wstring message = pfc::stringcvt::string_wide_from_utf8(error.get_ptr()).get_ptr();
+        speaklyrics_log_error(L"添加当前时间歌词：打开失败：%s，文件：%s。", message.c_str(), path.c_str());
         show_error(message.empty() ? L"\u6253\u5f00 LRC \u6587\u4ef6\u5931\u8d25\u3002" : message.c_str());
         return;
     }
@@ -224,6 +228,7 @@ void open_lrc_file() {
     g_current_path = path;
     init_encoding_combo(detected.empty() ? "utf8" : detected.c_str());
     set_dirty(false);
+    speaklyrics_log_info(L"添加当前时间歌词：打开成功：%s。", path.c_str());
     if (g_preview_edit) SetFocus(g_preview_edit);
 }
 

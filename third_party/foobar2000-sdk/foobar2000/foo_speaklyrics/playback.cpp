@@ -7,6 +7,7 @@
 #include "lyrics_jump_window.h"
 
 #include "speech_engine.h"
+#include "speaklyrics_log.h"
 
 
 
@@ -352,6 +353,7 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
     if (ec || !fs::is_directory(outputFolder, ec)) {
 
         FB2K_console_formatter() << "foo_speaklyrics: lrc download output folder is not available: " << pfc::stringcvt::string_utf8_from_wide(outputFolder.c_str()).get_ptr();
+        speaklyrics_log_error(L"自动下载：输出目录不可用：%s。", outputFolder.c_str());
 
         g_downloader_requested_track_key = key;
 
@@ -366,6 +368,7 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
     if (!fs::exists(exePath, ec)) {
 
         FB2K_console_formatter() << "foo_speaklyrics: downloader not found: " << pfc::stringcvt::string_utf8_from_wide(exePath.c_str()).get_ptr();
+        speaklyrics_log_error(L"自动下载：找不到歌词下载器：%s。", exePath.c_str());
 
         g_downloader_requested_track_key = key;
 
@@ -380,6 +383,7 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
     if (info.title.empty()) {
 
         FB2K_console_formatter() << "foo_speaklyrics: downloader skipped because track title is empty";
+        speaklyrics_log_warning(L"自动下载：跳过下载，当前歌曲标题为空。");
 
         g_downloader_requested_track_key = key;
 
@@ -436,10 +440,12 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
         CloseHandle(pi.hProcess);
 
         FB2K_console_formatter() << "foo_speaklyrics: started lrc downloader for " << pfc::stringcvt::string_utf8_from_wide(info.title.c_str()).get_ptr();
+        speaklyrics_log_info(L"自动下载：已启动下载器，标题：%s，艺术家：%s，来源：%s。", info.title.c_str(), info.artist.c_str(), sources.c_str());
 
     } else {
 
         FB2K_console_formatter() << "foo_speaklyrics: failed to start downloader, error " << static_cast<t_uint32>(GetLastError());
+        speaklyrics_log_error(L"自动下载：启动下载器失败，错误码：%lu。", GetLastError());
 
     }
 
@@ -884,6 +890,7 @@ void load_for_track(metadb_handle_ptr track) {
 
     if (!found) {
 
+        speaklyrics_log_warning(L"歌词加载：未找到可用 LRC，准备按设置尝试下载。");
         maybe_start_lrc_downloader(track);
 
         refresh_lyrics_jump_window();
@@ -903,10 +910,12 @@ void load_for_track(metadb_handle_ptr track) {
         if (g_current_lrc_temporary) cancel_pending_temp_lrc_delete(g_current_lrc);
 
         FB2K_console_formatter() << "foo_speaklyrics: loaded " << pfc::stringcvt::string_utf8_from_wide(found->path.c_str()).get_ptr();
+        speaklyrics_log_info(L"歌词加载：已加载 LRC：%s。", found->path.c_str());
 
     } else {
 
         FB2K_console_formatter() << "foo_speaklyrics: " << error;
+        speaklyrics_log_error(L"歌词加载：解析失败：%s，文件：%s。", pfc::stringcvt::string_wide_from_utf8(error.get_ptr()).get_ptr(), found->path.c_str());
 
     }
 

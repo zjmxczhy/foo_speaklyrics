@@ -1,5 +1,6 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 #include "sapi_speech.h"
+#include "speaklyrics_log.h"
 
 #include <sapi.h>
 
