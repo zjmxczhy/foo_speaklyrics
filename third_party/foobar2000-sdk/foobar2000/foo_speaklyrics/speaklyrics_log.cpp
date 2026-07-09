@@ -21,6 +21,15 @@ std::wstring utf8_to_wide(const char* text) {
     return pfc::stringcvt::string_wide_from_utf8(text).get_ptr();
 }
 
+std::wstring fb2k_path_to_native_wide(const char* path) {
+    if (!path || !*path) return L"";
+
+    pfc::string8 native;
+    if (foobar2000_io::extract_native_path(path, native)) return utf8_to_wide(native.get_ptr());
+
+    return utf8_to_wide(path);
+}
+
 std::string wide_to_utf8(const std::wstring& text) {
     return pfc::stringcvt::string_utf8_from_wide(text.c_str()).get_ptr();
 }
@@ -100,7 +109,7 @@ void log_v(const wchar_t* level, const wchar_t* format, va_list args) {
 std::wstring speaklyrics_log_file_path() {
     if (!core_api::are_services_available()) return L"";
     pfc::string8 path = core_api::pathInProfile("foo_speaklyrics.log");
-    return utf8_to_wide(path.get_ptr());
+    return fb2k_path_to_native_wide(path.get_ptr());
 }
 
 void speaklyrics_log_info(const wchar_t* format, ...) {

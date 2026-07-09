@@ -31,9 +31,12 @@ function Use-Patched-Tolk($Arch) {
     Copy-Item $TolkDll $TolkOut -Force
 
     $TolkLibDir = Join-Path $Root "third_party\tolk\libs\$Arch"
+    if (Test-Path $TolkLibDir) {
+        Remove-Item -LiteralPath $TolkLibDir -Recurse -Force
+    }
     New-Item -ItemType Directory -Force -Path $TolkLibDir | Out-Null
-    Get-ChildItem $PatchDir -File | Where-Object { $_.Name -like "ZDSRAPI*.dll" -or $_.Name -eq "ZDSRAPI.ini" } | ForEach-Object {
-        Copy-Item $_.FullName $TolkLibDir -Force
+    Get-ChildItem $PatchDir -File | Where-Object { $_.Extension -in ".dll", ".ini", ".conf" -and $_.Name -ne "Tolk.dll" } | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $TolkLibDir -Force
     }
     Write-Host "Using patched Tolk with ZDSR ${Arch}: $PatchDir"
 }

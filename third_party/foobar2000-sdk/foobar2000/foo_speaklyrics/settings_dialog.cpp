@@ -6,6 +6,8 @@
 
 #include "lrc_parser.h"
 
+#include "lyrics_copy.h"
+
 #include "resource.h"
 
 #include "sapi_speech.h"
@@ -261,6 +263,51 @@ static void save_source_list(HWND wnd) {
     cfg_lyric_sources.set(csv.get_ptr());
 }
 
+static const lyric_copy_mode g_copy_modes[] = {
+    lyric_copy_mode::ask,
+    lyric_copy_mode::timestamps,
+    lyric_copy_mode::plain,
+    lyric_copy_mode::split,
+};
+
+static int find_copy_mode_index(const char* id) {
+    lyric_copy_mode mode = lyric_copy_mode_from_id(id);
+    for (int i = 0; i < static_cast<int>(_countof(g_copy_modes)); ++i) {
+        if (g_copy_modes[i] == mode) return i;
+    }
+    return 0;
+}
+
+static lyric_copy_mode current_copy_mode(HWND wnd) {
+    HWND combo = GetDlgItem(wnd, IDC_COPY_MODE);
+    if (!combo) return lyric_copy_mode::ask;
+    int index = static_cast<int>(SendMessageW(combo, CB_GETCURSEL, 0, 0));
+    if (index < 0 || index >= static_cast<int>(_countof(g_copy_modes))) index = 0;
+    return g_copy_modes[index];
+}
+
+static void init_copy_mode_controls(HWND wnd) {
+    HWND combo = GetDlgItem(wnd, IDC_COPY_MODE);
+    if (!combo) return;
+    SetWindowTextW(combo, L"\u590d\u5236\u6b4c\u8bcd\u9ed8\u8ba4\u65b9\u5f0f");
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    for (lyric_copy_mode mode : g_copy_modes) {
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(lyric_copy_mode_display_name(mode)));
+    }
+    pfc::string8 id = cfg_copy_mode.get();
+    SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(find_copy_mode_index(id.get_ptr())), 0);
+    SetWindowTextW(GetDlgItem(wnd, IDC_STATIC_COPY_MODE), L"\u590d\u5236\u6b4c\u8bcd\u9ed8\u8ba4\u65b9\u5f0f");
+    SetWindowTextW(GetDlgItem(wnd, IDC_SET_COPY_DEFAULT), L"\u8bbe\u4e3a\u9ed8\u8ba4(&F)");
+    SetWindowTextW(GetDlgItem(wnd, IDC_STATIC_COPY_SPLIT_SEPARATORS), L"\u6b4c\u8bcd\u5206\u884c\u7b26\u53f7");
+    SetWindowTextW(GetDlgItem(wnd, IDC_COPY_SPLIT_SEPARATORS), L"\u6b4c\u8bcd\u5206\u884c\u7b26\u53f7");
+    SetDlgItemTextW(wnd, IDC_COPY_SPLIT_SEPARATORS, cfg_to_wide(cfg_copy_split_separators).c_str());
+}
+
+static void save_copy_mode_controls(HWND wnd) {
+    cfg_copy_mode.set(lyric_copy_mode_to_id(current_copy_mode(wnd)));
+    set_cfg_from_wide(cfg_copy_split_separators, get_dlg_text(wnd, IDC_COPY_SPLIT_SEPARATORS));
+}
+
 
 
 static HWND g_settings_dialog_wnd = nullptr;
@@ -291,15 +338,17 @@ static const int k_general_page_controls[] = {
     IDC_MISSING_LRC_RETRY_SECONDS,
     IDC_STATIC_LYRIC_VALID_MS,
     IDC_LYRIC_VALID_MS,
-    IDC_HIDE_MAIN_WINDOW_ON_STARTUP,
-    IDC_STATIC_HIDE_MAIN_WINDOW_DELAY_MS,
-    IDC_HIDE_MAIN_WINDOW_DELAY_MS,
 };
 
 static const int k_lyrics_page_controls[] = {
     IDC_STATIC_LYRIC_SOURCE_LIST,
     IDC_LYRIC_SOURCE_LIST,
     IDC_DOWNLOAD_TO_LRC_FOLDER,
+    IDC_STATIC_COPY_MODE,
+    IDC_COPY_MODE,
+    IDC_SET_COPY_DEFAULT,
+    IDC_STATIC_COPY_SPLIT_SEPARATORS,
+    IDC_COPY_SPLIT_SEPARATORS,
     IDC_STATIC_FILE,
     IDC_LRC_FILE,
     IDC_BROWSE_FILE,
@@ -502,11 +551,11 @@ static bool is_settings_edit_control(WORD id) {
     case IDC_ANNOUNCE_TRACK_DELAY_MS:
     case IDC_MISSING_LRC_RETRY_SECONDS:
     case IDC_LYRIC_VALID_MS:
-    case IDC_HIDE_MAIN_WINDOW_DELAY_MS:
     case IDC_LRC_FILE:
     case IDC_LRC_FOLDER:
     case IDC_TEMP_LRC_FOLDER:
     case IDC_TEMP_LRC_DELETE_DELAY_MS:
+    case IDC_COPY_SPLIT_SEPARATORS:
     case IDC_TTS_TEST_TEXT:
         return true;
     default:
@@ -538,14 +587,6 @@ static void init_dialog(HWND wnd) {
 
     SetDlgItemInt(wnd, IDC_LYRIC_VALID_MS, static_cast<UINT>(cfg_lyric_valid_ms.get()), FALSE);
 
-    CheckDlgButton(wnd, IDC_HIDE_MAIN_WINDOW_ON_STARTUP, cfg_hide_main_window_on_startup.get() ? BST_CHECKED : BST_UNCHECKED);
-    SetWindowTextW(GetDlgItem(wnd, IDC_HIDE_MAIN_WINDOW_ON_STARTUP), L"\u542f\u52a8\u540e\u9690\u85cf foobar2000 \u4e3b\u7a97\u53e3");
-    SetWindowTextW(GetDlgItem(wnd, IDC_STATIC_HIDE_MAIN_WINDOW_DELAY_MS), L"\u542f\u52a8\u540e\u9690\u85cf\u4e3b\u7a97\u53e3\u5ef6\u8fdf\u6beb\u79d2");
-    int hideDelayMs = static_cast<int>(cfg_hide_main_window_delay_ms.get());
-    if (hideDelayMs < 0) hideDelayMs = 0;
-    if (hideDelayMs > 10000) hideDelayMs = 10000;
-    SetDlgItemInt(wnd, IDC_HIDE_MAIN_WINDOW_DELAY_MS, static_cast<UINT>(hideDelayMs), FALSE);
-
     SetDlgItemTextW(wnd, IDC_LRC_FILE, L"");
 
     SetDlgItemTextW(wnd, IDC_LRC_FOLDER, cfg_to_wide(cfg_lrc_folder).c_str());
@@ -556,6 +597,8 @@ static void init_dialog(HWND wnd) {
 
     CheckDlgButton(wnd, IDC_DOWNLOAD_TO_LRC_FOLDER, cfg_download_to_lrc_folder.get() ? BST_CHECKED : BST_UNCHECKED);
     SetWindowTextW(GetDlgItem(wnd, IDC_DOWNLOAD_TO_LRC_FOLDER), L"\u4e0b\u8f7d\u5230\u6307\u5b9a\u7684\u6b4c\u8bcd\u76ee\u5f55");
+
+    init_copy_mode_controls(wnd);
 
     int deleteDelayMs = static_cast<int>(cfg_temp_lrc_delete_delay_ms.get());
     if (deleteDelayMs < 0) deleteDelayMs = 0;
@@ -591,10 +634,6 @@ static void save_dialog(HWND wnd) {
 
     int validMs = static_cast<int>(GetDlgItemInt(wnd, IDC_LYRIC_VALID_MS, &validOk, FALSE));
 
-    BOOL hideDelayOk = FALSE;
-
-    int hideDelayMs = static_cast<int>(GetDlgItemInt(wnd, IDC_HIDE_MAIN_WINDOW_DELAY_MS, &hideDelayOk, FALSE));
-
     BOOL deleteDelayOk = FALSE;
 
     int deleteDelayMs = static_cast<int>(GetDlgItemInt(wnd, IDC_TEMP_LRC_DELETE_DELAY_MS, &deleteDelayOk, FALSE));
@@ -624,15 +663,6 @@ static void save_dialog(HWND wnd) {
 
     cfg_lyric_valid_ms = (validOk && validMs > 0) ? validMs : 3000;
 
-    cfg_hide_main_window_on_startup = (IsDlgButtonChecked(wnd, IDC_HIDE_MAIN_WINDOW_ON_STARTUP) == BST_CHECKED);
-
-    if (hideDelayOk && hideDelayMs >= 0) {
-        if (hideDelayMs > 10000) hideDelayMs = 10000;
-        cfg_hide_main_window_delay_ms = hideDelayMs;
-    } else {
-        cfg_hide_main_window_delay_ms = 800;
-    }
-
     if (deleteDelayOk && deleteDelayMs > 0) {
         if (deleteDelayMs > 600000) deleteDelayMs = 600000;
         cfg_temp_lrc_delete_delay_ms = deleteDelayMs;
@@ -659,6 +689,8 @@ static void save_dialog(HWND wnd) {
     save_source_list(wnd);
 
     cfg_download_to_lrc_folder = (IsDlgButtonChecked(wnd, IDC_DOWNLOAD_TO_LRC_FOLDER) == BST_CHECKED);
+
+    save_copy_mode_controls(wnd);
 
     cfg_use_screen_reader = (IsDlgButtonChecked(wnd, IDC_USE_SCREEN_READER) == BST_CHECKED);
 
@@ -700,9 +732,9 @@ static INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_ANNOUNCE_TRACK && HIWORD(wp) == BN_CLICKED) {
             set_dialog_dirty(wnd, true);
-        } else if (LOWORD(wp) == IDC_HIDE_MAIN_WINDOW_ON_STARTUP && HIWORD(wp) == BN_CLICKED) {
-            set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_DOWNLOAD_TO_LRC_FOLDER && HIWORD(wp) == BN_CLICKED) {
+            set_dialog_dirty(wnd, true);
+        } else if (LOWORD(wp) == IDC_COPY_MODE && HIWORD(wp) == CBN_SELCHANGE) {
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_USE_SCREEN_READER && HIWORD(wp) == BN_CLICKED) {
             update_tts_detail_visibility(wnd);
@@ -769,6 +801,12 @@ static INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_TTS_TEST:
 
             sapi_speak(L"sapi5", current_tts_voice_id(wnd).c_str(), current_tts_rate(wnd), get_dlg_text(wnd, IDC_TTS_TEST_TEXT).c_str(), true);
+
+            return TRUE;
+
+        case IDC_SET_COPY_DEFAULT:
+
+            save_copy_mode_controls(wnd);
 
             return TRUE;
 

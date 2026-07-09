@@ -68,6 +68,7 @@ namespace LrcDownloader
 
                 var outputPath = Path.Combine(options.OutDir, SanitizeFileName(fileName));
                 File.WriteAllText(outputPath, NormalizeNewlines(StripEnhancedLrcTags(record.SyncedLyrics)), new UTF8Encoding(false));
+                AppendManifest(options.ManifestPath, outputPath);
 
                 Console.WriteLine(outputPath);
                 return 0;
@@ -699,6 +700,7 @@ namespace LrcDownloader
                 else if (arg == "--out") options.OutDir = Next(args, ref i, arg);
                 else if (arg == "--sources") options.Sources = Next(args, ref i, arg);
                 else if (arg == "--file-name") options.FileName = Next(args, ref i, arg);
+                else if (arg == "--manifest") options.ManifestPath = Next(args, ref i, arg);
                 else if (arg == "--duration") options.DurationSeconds = ParseDuration(Next(args, ref i, arg));
                 else if (arg == "--cached-only") options.CachedOnly = true;
                 else if (arg == "--search-only") options.SearchOnly = true;
@@ -758,6 +760,21 @@ namespace LrcDownloader
         {
             foreach (var c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
             return name.Trim();
+        }
+
+        private static void AppendManifest(string manifestPath, string outputPath)
+        {
+            if (string.IsNullOrWhiteSpace(manifestPath) || string.IsNullOrWhiteSpace(outputPath)) return;
+
+            try
+            {
+                var directory = Path.GetDirectoryName(manifestPath);
+                if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+                File.AppendAllText(manifestPath, Path.GetFullPath(outputPath) + "\r\n", new UTF8Encoding(false));
+            }
+            catch
+            {
+            }
         }
 
         private static string NormalizeNewlines(string text)
@@ -1173,6 +1190,7 @@ namespace LrcDownloader
             Console.WriteLine("  --duration    Track duration in seconds, for example 233 or 233.4.");
             Console.WriteLine("  --out         Output folder. Required.");
             Console.WriteLine("  --file-name   Optional output LRC file name.");
+            Console.WriteLine("  --manifest    Optional manifest file to record downloaded temporary LRC paths.");
             Console.WriteLine("  --sources     Comma separated lyric sources: lrclib,qq1,qq2,netease. Empty means no online download. qq and 163 are compatibility aliases.");
             Console.WriteLine("  --cached-only Do not call LRCLIB external lookup endpoint.");
             Console.WriteLine("  --search-only Skip exact signature lookup and only use search.");
@@ -1188,6 +1206,7 @@ namespace LrcDownloader
             public int DurationSeconds;
             public string OutDir;
             public string FileName;
+            public string ManifestPath;
             public string Sources = "lrclib,qq1";
             public bool CachedOnly;
             public bool SearchOnly;

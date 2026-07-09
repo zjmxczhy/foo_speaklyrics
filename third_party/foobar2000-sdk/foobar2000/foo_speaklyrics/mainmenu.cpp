@@ -2,6 +2,8 @@
 
 #include "config.h"
 
+#include "lyrics_copy.h"
+
 #include "playback.h"
 #include "lyrics_jump_window.h"
 #include "lyrics_search_window.h"
@@ -16,6 +18,7 @@ static const GUID guid_menu_group = { 0xbf62fc58, 0xc9d2, 0x4d55,{ 0x9c, 0x48, 0
 static const GUID guid_cmd_settings = { 0x33c87fa3, 0x74d0, 0x4b84,{ 0x86, 0x16, 0xb7, 0xe5, 0x45, 0x97, 0x5f, 0x4d } };
 
 static const GUID guid_cmd_toggle_auto = { 0xde9f9261, 0x3053, 0x4d09,{ 0x8f, 0xcf, 0x13, 0xcd, 0xda, 0x77, 0x12, 0x8e } };
+static const GUID guid_cmd_speak_current_track = { 0x1173812e, 0xd2a6, 0x46ba,{ 0xa8, 0x63, 0x28, 0x8d, 0xea, 0x9f, 0x40, 0x16 } };
 
 static const GUID guid_cmd_load_file = { 0x929354bc, 0x62a8, 0x4bb7,{ 0x80, 0x3d, 0xa6, 0xe8, 0x5b, 0x1f, 0xac, 0xf3 } };
 
@@ -67,7 +70,7 @@ class speaklyrics_menu : public mainmenu_commands {
 
 public:
 
-    enum { cmd_settings, cmd_toggle_auto, cmd_load_file, cmd_set_folder, cmd_set_temp_folder, cmd_search_lrc, cmd_add_timestamp_lrc, cmd_copy_plain_lyrics, cmd_jump_by_lyrics, cmd_total };
+    enum { cmd_settings, cmd_toggle_auto, cmd_speak_current_track, cmd_load_file, cmd_set_folder, cmd_set_temp_folder, cmd_search_lrc, cmd_add_timestamp_lrc, cmd_copy_plain_lyrics, cmd_jump_by_lyrics, cmd_total };
 
 
 
@@ -82,6 +85,8 @@ public:
         case cmd_settings: return guid_cmd_settings;
 
         case cmd_toggle_auto: return guid_cmd_toggle_auto;
+
+        case cmd_speak_current_track: return guid_cmd_speak_current_track;
 
         case cmd_load_file: return guid_cmd_load_file;
 
@@ -109,6 +114,8 @@ public:
 
         case cmd_toggle_auto: set_utf8(out, L"\u81EA\u52A8\u6717\u8BFB\u6B4C\u8BCD"); break;
 
+        case cmd_speak_current_track: set_utf8(out, L"\u67E5\u770B\u5F53\u524D\u64AD\u653E\u6B4C\u66F2\u4FE1\u606F"); break;
+
         case cmd_load_file: set_utf8(out, L"\u52A0\u8F7D\u672C\u5730LRC\u6B4C\u8BCD(&L)"); break;
 
         case cmd_set_folder: set_utf8(out, L"\u8BBE\u7F6ELRC\u6B4C\u8BCD\u76EE\u5F55(&R)"); break;
@@ -116,7 +123,7 @@ public:
         case cmd_set_temp_folder: set_utf8(out, L"\u8BBE\u7F6ELRC\u6B4C\u8BCD\u4E34\u65F6\u76EE\u5F55(&&c) c"); break;
         case cmd_search_lrc: set_utf8(out, L"\u641C\u7D22LRC\u6B4C\u8BCD(&&o) o"); break;
         case cmd_add_timestamp_lrc: set_utf8(out, L"\u6DFB\u52A0\u5F53\u524D\u65F6\u95F4\u6B4C\u8BCD"); break;
-        case cmd_copy_plain_lyrics: set_utf8(out, L"\u590D\u5236\u65E0\u65F6\u95F4\u6233\u6B4C\u8BCD(&&p) p"); break;
+        case cmd_copy_plain_lyrics: set_utf8(out, L"\u590D\u5236\u6B4C\u8BCD(&&p) p"); break;
         case cmd_jump_by_lyrics: set_utf8(out, L"\u6309\u6B4C\u8BCD\u8DF3\u8F6C(&&G) g"); break;
 
         default: uBugCheck();
@@ -135,6 +142,8 @@ public:
 
         case cmd_toggle_auto: set_utf8(out, L"\u5F00\u542F\u6216\u5173\u95ED\u81EA\u52A8\u6717\u8BFB\u6B4C\u8BCD\u3002"); return true;
 
+        case cmd_speak_current_track: set_utf8(out, L"\u6309\u201C\u5207\u6362\u6B4C\u66F2\u64AD\u62A5\u5185\u5BB9\u201D\u7684\u8BBE\u7F6E\u64AD\u62A5\u5F53\u524D\u6B4C\u66F2\u4FE1\u606F\u3002"); return true;
+
         case cmd_load_file: set_utf8(out, L"\u624B\u52A8\u9009\u62E9\u672C\u5730 LRC \u6B4C\u8BCD\u6587\u4EF6\u3002"); return true;
 
         case cmd_set_folder: set_utf8(out, L"\u9009\u62E9\u672C\u5730 LRC \u6B4C\u8BCD\u76EE\u5F55\u3002"); return true;
@@ -142,7 +151,7 @@ public:
         case cmd_set_temp_folder: set_utf8(out, L"\u9009\u62E9 LRC \u6B4C\u8BCD\u4E34\u65F6\u76EE\u5F55\u3002\u4ECE\u8BE5\u76EE\u5F55\u52A0\u8F7D\u7684\u6B4C\u8BCD\u5728\u5207\u6362\u540E\u4F1A\u5220\u9664\u3002"); return true;
         case cmd_search_lrc: set_utf8(out, L"\u6253\u5F00\u641C\u7D22lrc\u6B4C\u8BCD\u7A97\u53E3\u3002"); return true;
         case cmd_add_timestamp_lrc: set_utf8(out, L"\u6253\u5F00 LRC \u624B\u52A8\u6253\u8F74\u7A97\u53E3\uFF0C\u628A\u5F53\u524D\u64AD\u653E\u65F6\u95F4\u5199\u5165\u6B4C\u8BCD\u3002"); return true;
-        case cmd_copy_plain_lyrics: set_utf8(out, L"\u590D\u5236\u5F53\u524D\u5DF2\u52A0\u8F7D LRC \u6B4C\u8BCD\u7684\u65E0\u65F6\u95F4\u6233\u6587\u672C\u3002"); return true;
+        case cmd_copy_plain_lyrics: set_utf8(out, L"\u6309\u8BBE\u7F6E\u590D\u5236\u5F53\u524D\u5DF2\u52A0\u8F7D LRC \u6B4C\u8BCD\u3002"); return true;
         case cmd_jump_by_lyrics: set_utf8(out, L"\u6253\u5F00\u6B4C\u8BCD\u5217\u8868\uFF0C\u9009\u4E2D\u4E00\u53E5\u540E\u56DE\u8F66\u8DF3\u8F6C\u5230\u5BF9\u5E94\u64AD\u653E\u4F4D\u7F6E\u3002"); return true;
 
         default: return false;
@@ -182,6 +191,12 @@ public:
             break;
 
         }
+
+        case cmd_speak_current_track:
+
+            speak_current_track_announcement();
+
+            break;
 
         case cmd_load_file: {
 
@@ -243,7 +258,7 @@ public:
 
         case cmd_copy_plain_lyrics:
 
-            copy_current_lyrics_without_timestamps();
+            copy_current_lyrics(lyric_copy_mode_from_id(cfg_copy_mode.get().get_ptr()));
 
             break;
 

@@ -8,6 +8,10 @@ void bind_manual_lrc_to_current_track();
 
 bool copy_current_lyrics_without_timestamps();
 
+bool copy_text_to_clipboard(const std::wstring& text);
+
+bool speak_current_track_announcement();
+
 struct lyric_jump_item {
     int time_ms = 0;
     std::wstring text;

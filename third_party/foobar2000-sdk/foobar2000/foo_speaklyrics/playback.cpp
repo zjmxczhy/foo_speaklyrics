@@ -8,6 +8,7 @@
 
 #include "speech_engine.h"
 #include "speaklyrics_log.h"
+#include "temp_lrc_manifest.h"
 
 
 
@@ -324,7 +325,7 @@ void process_pending_track_announcement() {
 
 void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
-    if (!cfg_auto_speak.get() || track.is_empty()) return;
+    if (track.is_empty()) return;
 
 
 
@@ -393,6 +394,9 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
 
 
+    bool temporaryDownload = !cfg_download_to_lrc_folder.get();
+    std::wstring manifestPath = temporaryDownload ? temp_lrc_manifest_path() : L"";
+
     std::wstring command = command_line_quote(exePath.wstring()) +
 
         L" --title " + command_line_quote(info.title) +
@@ -406,6 +410,8 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
         L" --sources " + command_line_quote(sources) +
 
         L" --out " + command_line_quote(outputFolder);
+
+    if (!manifestPath.empty()) command += L" --manifest " + command_line_quote(manifestPath);
 
 
 
@@ -659,6 +665,7 @@ std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) {
 
 }
 
+}
 
 
 
@@ -693,6 +700,8 @@ bool copy_text_to_clipboard(const std::wstring& text) {
     CloseClipboard();
     return true;
 }
+
+namespace {
 
 static bool same_path_text(const std::wstring& a, const std::wstring& b) {
     return _wcsicmp(a.c_str(), b.c_str()) == 0;
@@ -858,7 +867,7 @@ int lyric_valid_ms() {
 
 bool retry_load_missing_lrc(double seconds) {
 
-    if (!cfg_auto_speak.get() || !g_doc.empty() || g_paused) return false;
+    if (!g_doc.empty() || g_paused) return false;
 
     if ((seconds - g_last_missing_lrc_retry_time) * 1000.0 < static_cast<double>(missing_lrc_retry_ms())) return false;
 
@@ -1087,6 +1096,24 @@ bool copy_current_lyrics_without_timestamps() {
     bool ok = copy_text_to_clipboard(text);
     speech_queue_speak(ok ? L"\u6b4c\u8bcd\u590d\u5236\u6210\u529f" : L"\u6b4c\u8bcd\u590d\u5236\u5931\u8d25", true);
     return ok;
+}
+
+bool speak_current_track_announcement() {
+    metadb_handle_ptr track;
+    if (!static_api_ptr_t<playback_control>()->get_now_playing(track) || track.is_empty()) {
+        speech_queue_speak(L"\u5f53\u524d\u6ca1\u6709\u6b63\u5728\u64ad\u653e\u7684\u6b4c\u66f2", true);
+        return false;
+    }
+
+    std::wstring text = announce_track_text(track);
+    if (text.empty()) {
+        speech_queue_speak(L"\u65e0\u6cd5\u83b7\u53d6\u5f53\u524d\u6b4c\u66f2\u4fe1\u606f", true);
+        return false;
+    }
+
+    cancel_pending_track_announcement();
+    speech_queue_speak(text.c_str(), true);
+    return true;
 }
 
 void reload_current_lyrics() {

@@ -169,6 +169,7 @@
     <ClCompile Include="config.cpp" />
     <ClCompile Include="initquit.cpp" />
     <ClCompile Include="lrc_parser.cpp" />
+    <ClCompile Include="lyrics_copy.cpp" />
     <ClCompile Include="lyrics_jump_window.cpp" />
     <ClCompile Include="lyrics_search_window.cpp" />
     <ClCompile Include="lyrics_timestamp_window.cpp" />
@@ -185,11 +186,13 @@
     <ClCompile Include="sapi_speech.cpp" />
     <ClCompile Include="speaklyrics_log.cpp" />
     <ClCompile Include="speech_engine.cpp" />
+    <ClCompile Include="temp_lrc_manifest.cpp" />
     <ClCompile Include="tolk_bridge.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="config.h" />
     <ClInclude Include="lrc_parser.h" />
+    <ClInclude Include="lyrics_copy.h" />
     <ClInclude Include="lyrics_jump_window.h" />
     <ClInclude Include="lyrics_search_window.h" />
     <ClInclude Include="lyrics_timestamp_window.h" />
@@ -199,6 +202,7 @@
     <ClInclude Include="speaklyrics_log.h" />
     <ClInclude Include="speech_engine.h" />
     <ClInclude Include="stdafx.h" />
+    <ClInclude Include="temp_lrc_manifest.h" />
     <ClInclude Include="tolk_bridge.h" />
   </ItemGroup>
   <ItemGroup>

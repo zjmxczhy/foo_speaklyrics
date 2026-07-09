@@ -6,6 +6,7 @@
 #include "resource.h"
 #include "speech_engine.h"
 #include "speaklyrics_log.h"
+#include "temp_lrc_manifest.h"
 
 #include <cwctype>
 #include <sstream>
@@ -275,7 +276,7 @@ std::wstring output_folder_for_download(bool permanent) {
     return expand_environment_path(toLrcFolder ? cfg_to_wide_local(cfg_lrc_folder) : cfg_to_wide_local(cfg_temp_lrc_folder));
 }
 
-bool download_item_to_folder(const search_result_item& item, const std::wstring& folder, std::wstring& error) {
+bool download_item_to_folder(const search_result_item& item, const std::wstring& folder, bool temporary, std::wstring& error) {
     if (item.placeholder) return false;
     if (trim_text(folder).empty()) {
         error = L"\u6CA1\u6709\u8BBE\u7F6ELRC\u6B4C\u8BCD\u76EE\u5F55";
@@ -297,6 +298,10 @@ bool download_item_to_folder(const search_result_item& item, const std::wstring&
         L" --sources " + command_line_quote(source) +
         L" --out " + command_line_quote(folder) +
         L" --search-only";
+    if (temporary) {
+        std::wstring manifestPath = temp_lrc_manifest_path();
+        if (!manifestPath.empty()) cmd += L" --manifest " + command_line_quote(manifestPath);
+    }
     std::string output;
     DWORD code = 3;
     bool ok = run_process_capture_stdout(cmd, exe.parent_path(), output, code);
@@ -321,9 +326,10 @@ void start_download(size_t index, bool permanent) {
     if (index >= g_items.size() || g_items[index].placeholder) return;
     search_result_item item = g_items[index];
     std::wstring folder = output_folder_for_download(permanent);
-    std::thread([item, folder]() {
+    bool temporary = !permanent && !cfg_download_to_lrc_folder.get();
+    std::thread([item, folder, temporary]() {
         auto payload = new download_done_payload();
-        payload->ok = download_item_to_folder(item, folder, payload->error);
+        payload->ok = download_item_to_folder(item, folder, temporary, payload->error);
         if (g_window && IsWindow(g_window)) PostMessageW(g_window, WM_DOWNLOAD_DONE, 0, reinterpret_cast<LPARAM>(payload));
         else delete payload;
     }).detach();
@@ -385,7 +391,8 @@ void start_search() {
         } else if (should_auto_download(payload->items.front())) {
             std::wstring error;
             std::wstring outputFolder = output_folder_for_download(false);
-            if (!trim_text(outputFolder).empty() && download_item_to_folder(payload->items.front(), outputFolder, error)) {
+            bool temporary = !cfg_download_to_lrc_folder.get();
+            if (!trim_text(outputFolder).empty() && download_item_to_folder(payload->items.front(), outputFolder, temporary, error)) {
                 payload->auto_downloaded = true;
             }
         }

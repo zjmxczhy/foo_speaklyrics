@@ -29,11 +29,9 @@ function Copy-Payload($TargetDir, $ArchName, $ComponentPlatform) {
     New-Item -ItemType Directory -Force -Path $TargetDir,$TolkTarget | Out-Null
     Copy-Item $ComponentDll $TargetDir -Force
     Copy-Item $TolkDll $TolkTarget -Force
-    Get-ChildItem (Join-Path $TolkLibDir "*.dll") | ForEach-Object {
+    Get-ChildItem $TolkLibDir -File | Where-Object { $_.Extension -in ".dll", ".ini", ".conf" } | ForEach-Object {
         Copy-Item $_.FullName $TolkTarget -Force
     }
-    $ini = Join-Path $TolkLibDir "ZDSRAPI.ini"
-    if (Test-Path $ini) { Copy-Item $ini $TolkTarget -Force }
     Copy-Downloader $TargetDir
 }
 
