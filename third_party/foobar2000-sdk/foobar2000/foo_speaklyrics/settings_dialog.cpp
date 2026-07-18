@@ -12,6 +12,10 @@
 
 #include "sapi_speech.h"
 
+#include "speech_engine.h"
+
+#include "speaklyrics_log.h"
+
 
 
 
@@ -211,6 +215,37 @@ static void save_lrc_encoding_combo(HWND wnd) {
     cfg_lrc_encoding.set(encodings[index].id);
 }
 
+struct lyric_speak_mode_item {
+    const char* id;
+    const wchar_t* name;
+};
+
+static const lyric_speak_mode_item g_lyric_speak_modes[] = {
+    { "timestamp", L"\u6717\u8bfb\u65f6\u95f4\u6233\u6b4c\u8bcd" },
+    { "advance", L"\u52a8\u6001\u63d0\u524d\u6717\u8bfb\u6b4c\u8bcd" },
+};
+
+static void init_lyric_speak_mode_combo(HWND wnd) {
+    HWND combo = GetDlgItem(wnd, IDC_LYRIC_SPEAK_MODE);
+    if (!combo) return;
+    SetWindowTextW(combo, L"\u6b4c\u8bcd\u6717\u8bfb\u65b9\u5f0f");
+    pfc::string8 configured = cfg_lyric_speak_mode.get();
+    int selected = 0;
+    for (size_t i = 0; i < _countof(g_lyric_speak_modes); ++i) {
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(g_lyric_speak_modes[i].name));
+        if (_stricmp(configured.get_ptr(), g_lyric_speak_modes[i].id) == 0) selected = static_cast<int>(i);
+    }
+    SendMessageW(combo, CB_SETCURSEL, selected, 0);
+}
+
+static void save_lyric_speak_mode_combo(HWND wnd) {
+    HWND combo = GetDlgItem(wnd, IDC_LYRIC_SPEAK_MODE);
+    if (!combo) return;
+    int index = static_cast<int>(SendMessageW(combo, CB_GETCURSEL, 0, 0));
+    if (index < 0 || index >= static_cast<int>(_countof(g_lyric_speak_modes))) index = 0;
+    cfg_lyric_speak_mode.set(g_lyric_speak_modes[index].id);
+}
+
 static bool csv_has_token(const std::string& csv, const char* token) {
     size_t start = 0;
     while (start <= csv.size()) {
@@ -323,6 +358,159 @@ static bool g_settings_dialog_initializing = false;
 
 static std::vector<sapi_voice_info> g_sapi_voices;
 
+struct screen_reader_option {
+    const char* id;
+    const wchar_t* name;
+};
+
+static const screen_reader_option g_screen_reader_targets[] = {
+    { "auto", L"\u81ea\u52a8" },
+    { "boy", L"\u4fdd\u76ca" },
+    { "zdsr", L"\u4e89\u6e21" },
+};
+
+static const char* g_screen_reader_channel_mode_ids[] = {
+    "main",
+    "shared",
+    "named",
+};
+
+struct screen_reader_channel_profile {
+    int mode = 2;
+    std::wstring name = L"\u6717\u8bfb\u6b4c\u8bcd\u901a\u9053";
+};
+
+static screen_reader_channel_profile g_boy_channel_profile;
+static screen_reader_channel_profile g_zdsr_channel_profile;
+static int g_current_screen_reader_target = 0;
+
+static int find_screen_reader_option(const screen_reader_option* options, size_t count, const char* id, int fallback) {
+    if (id && *id) {
+        for (size_t i = 0; i < count; ++i) {
+            if (_stricmp(options[i].id, id) == 0) return static_cast<int>(i);
+        }
+    }
+    return fallback;
+}
+
+static int current_screen_reader_target(HWND wnd) {
+    int index = static_cast<int>(SendDlgItemMessageW(wnd, IDC_SCREEN_READER_TARGET, CB_GETCURSEL, 0, 0));
+    return index >= 0 && index < static_cast<int>(_countof(g_screen_reader_targets)) ? index : 0;
+}
+
+static int find_screen_reader_channel_mode(const char* id) {
+    if (id && *id) {
+        for (size_t i = 0; i < _countof(g_screen_reader_channel_mode_ids); ++i) {
+            if (_stricmp(g_screen_reader_channel_mode_ids[i], id) == 0) return static_cast<int>(i);
+        }
+    }
+    return 2;
+}
+
+static screen_reader_channel_profile* screen_reader_profile_for_target(int target) {
+    if (target == 1) return &g_boy_channel_profile;
+    if (target == 2) return &g_zdsr_channel_profile;
+    return nullptr;
+}
+
+static std::wstring clean_channel_input(std::wstring value) {
+    value.erase(std::remove_if(value.begin(), value.end(), [](wchar_t ch) {
+        return ch == L'\r' || ch == L'\n' || ch < L' ';
+    }), value.end());
+    while (!value.empty() && value.front() <= L' ') value.erase(value.begin());
+    while (!value.empty() && value.back() <= L' ') value.pop_back();
+    if (value.size() > 64) value.resize(64);
+    return value;
+}
+
+static void capture_screen_reader_channel_profile(HWND wnd, int target) {
+    screen_reader_channel_profile* profile = screen_reader_profile_for_target(target);
+    if (!profile) return;
+    std::wstring value = clean_channel_input(get_dlg_text(wnd, IDC_SCREEN_READER_CHANNEL_NAME));
+    if (_wcsicmp(value.c_str(), L"\u4e3b\u901a\u9053") == 0) {
+        profile->mode = 0;
+    } else if (_wcsicmp(value.c_str(), L"\u4e09\u65b9\u5171\u4eab\u901a\u9053") == 0) {
+        profile->mode = 1;
+    } else {
+        profile->mode = 2;
+        profile->name = value.empty() ? L"\u6717\u8bfb\u6b4c\u8bcd\u901a\u9053" : value;
+    }
+}
+
+static void update_screen_reader_channel_enabled_state(HWND wnd) {
+    bool useScreenReader = IsDlgButtonChecked(wnd, IDC_USE_SCREEN_READER) == BST_CHECKED;
+    int target = current_screen_reader_target(wnd);
+    bool hasChannelSettings = useScreenReader && target != 0;
+    EnableWindow(GetDlgItem(wnd, IDC_SCREEN_READER_TARGET), useScreenReader ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(wnd, IDC_STATIC_SCREEN_READER_CHANNEL_NAME), hasChannelSettings ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(wnd, IDC_SCREEN_READER_CHANNEL_NAME), hasChannelSettings ? TRUE : FALSE);
+}
+
+static void load_screen_reader_channel_profile(HWND wnd, int target) {
+    screen_reader_channel_profile* profile = screen_reader_profile_for_target(target);
+    if (profile) {
+        const wchar_t* value = profile->mode == 0 ? L"\u4e3b\u901a\u9053" :
+            profile->mode == 1 ? L"\u4e09\u65b9\u5171\u4eab\u901a\u9053" : profile->name.c_str();
+        SetDlgItemTextW(wnd, IDC_SCREEN_READER_CHANNEL_NAME, value);
+    } else {
+        SetDlgItemTextW(wnd, IDC_SCREEN_READER_CHANNEL_NAME, L"");
+    }
+    update_screen_reader_channel_enabled_state(wnd);
+}
+
+static void init_screen_reader_channel_controls(HWND wnd) {
+    HWND targetCombo = GetDlgItem(wnd, IDC_SCREEN_READER_TARGET);
+    if (!targetCombo) return;
+
+    SetWindowTextW(targetCombo, L"\u6717\u8bfb\u63a5\u53e3");
+    SetWindowTextW(GetDlgItem(wnd, IDC_SCREEN_READER_CHANNEL_NAME), L"\u901a\u9053\u540d\u79f0");
+    SendMessageW(GetDlgItem(wnd, IDC_SCREEN_READER_CHANNEL_NAME), EM_SETLIMITTEXT, 64, 0);
+
+    SendMessageW(targetCombo, CB_RESETCONTENT, 0, 0);
+    for (const auto& item : g_screen_reader_targets) {
+        SendMessageW(targetCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.name));
+    }
+    pfc::string8 boyMode = cfg_boy_channel_mode.get();
+    pfc::string8 zdsrMode = cfg_zdsr_channel_mode.get();
+    g_boy_channel_profile.mode = find_screen_reader_channel_mode(boyMode.get_ptr());
+    g_boy_channel_profile.name = cfg_to_wide(cfg_boy_channel_name);
+    g_zdsr_channel_profile.mode = find_screen_reader_channel_mode(zdsrMode.get_ptr());
+    g_zdsr_channel_profile.name = cfg_to_wide(cfg_zdsr_channel_name);
+
+    pfc::string8 target = cfg_screen_reader_channel_target.get();
+    g_current_screen_reader_target = find_screen_reader_option(g_screen_reader_targets, _countof(g_screen_reader_targets), target.get_ptr(), 0);
+    SendMessageW(targetCombo, CB_SETCURSEL, static_cast<WPARAM>(g_current_screen_reader_target), 0);
+    load_screen_reader_channel_profile(wnd, g_current_screen_reader_target);
+}
+
+static std::wstring normalized_channel_name(std::wstring value) {
+    value = clean_channel_input(std::move(value));
+    if (value.empty()) value = L"\u6717\u8bfb\u6b4c\u8bcd\u901a\u9053";
+    return value;
+}
+
+static bool save_screen_reader_channel_controls(HWND wnd) {
+    capture_screen_reader_channel_profile(wnd, g_current_screen_reader_target);
+    g_boy_channel_profile.name = normalized_channel_name(g_boy_channel_profile.name);
+    g_zdsr_channel_profile.name = normalized_channel_name(g_zdsr_channel_profile.name);
+
+    pfc::string8 oldBoyMode = cfg_boy_channel_mode.get();
+    pfc::string8 oldZdsrMode = cfg_zdsr_channel_mode.get();
+    bool profilesChanged =
+        _stricmp(oldBoyMode.get_ptr(), g_screen_reader_channel_mode_ids[g_boy_channel_profile.mode]) != 0 ||
+        _stricmp(oldZdsrMode.get_ptr(), g_screen_reader_channel_mode_ids[g_zdsr_channel_profile.mode]) != 0 ||
+        cfg_to_wide(cfg_boy_channel_name) != g_boy_channel_profile.name ||
+        cfg_to_wide(cfg_zdsr_channel_name) != g_zdsr_channel_profile.name;
+
+    int target = current_screen_reader_target(wnd);
+    cfg_screen_reader_channel_target.set(g_screen_reader_targets[target].id);
+    cfg_boy_channel_mode.set(g_screen_reader_channel_mode_ids[g_boy_channel_profile.mode]);
+    cfg_zdsr_channel_mode.set(g_screen_reader_channel_mode_ids[g_zdsr_channel_profile.mode]);
+    set_cfg_from_wide(cfg_boy_channel_name, g_boy_channel_profile.name);
+    set_cfg_from_wide(cfg_zdsr_channel_name, g_zdsr_channel_profile.name);
+    return profilesChanged;
+}
+
 static const int k_general_page_controls[] = {
     IDC_AUTO_SPEAK,
     IDC_ANNOUNCE_TRACK,
@@ -332,6 +520,8 @@ static const int k_general_page_controls[] = {
     IDC_ANNOUNCE_TRACK_DELAY_MS,
     IDC_STATIC_LRC_ENCODING,
     IDC_LRC_ENCODING,
+    IDC_STATIC_LYRIC_SPEAK_MODE,
+    IDC_LYRIC_SPEAK_MODE,
     IDC_STATIC_LEAD,
     IDC_LEAD_MS,
     IDC_STATIC_MISSING_LRC_RETRY_SECONDS,
@@ -343,12 +533,12 @@ static const int k_general_page_controls[] = {
 static const int k_lyrics_page_controls[] = {
     IDC_STATIC_LYRIC_SOURCE_LIST,
     IDC_LYRIC_SOURCE_LIST,
-    IDC_DOWNLOAD_TO_LRC_FOLDER,
     IDC_STATIC_COPY_MODE,
     IDC_COPY_MODE,
     IDC_SET_COPY_DEFAULT,
     IDC_STATIC_COPY_SPLIT_SEPARATORS,
     IDC_COPY_SPLIT_SEPARATORS,
+    IDC_COPY_FILTER_LEADING_CREDITS,
     IDC_STATIC_FILE,
     IDC_LRC_FILE,
     IDC_BROWSE_FILE,
@@ -364,6 +554,11 @@ static const int k_lyrics_page_controls[] = {
 
 static const int k_tts_page_controls[] = {
     IDC_USE_SCREEN_READER,
+    IDC_STATIC_SCREEN_READER_TARGET,
+    IDC_SCREEN_READER_TARGET,
+    IDC_STATIC_SCREEN_READER_CHANNEL_NAME,
+    IDC_SCREEN_READER_CHANNEL_NAME,
+    IDC_STATIC_SCREEN_READER_CHANNEL_NOTE,
     IDC_STATIC_TTS_VOICE,
     IDC_TTS_VOICE,
     IDC_STATIC_TTS_RATE,
@@ -398,7 +593,7 @@ static void set_control_page_visible(HWND wnd, int id, bool visible) {
 
 static void update_tts_detail_visibility(HWND wnd) {
     bool useScreenReader = IsDlgButtonChecked(wnd, IDC_USE_SCREEN_READER) == BST_CHECKED;
-    const int detailControls[] = {
+    const int sapiControls[] = {
         IDC_STATIC_TTS_VOICE,
         IDC_TTS_VOICE,
         IDC_STATIC_TTS_RATE,
@@ -408,9 +603,20 @@ static void update_tts_detail_visibility(HWND wnd) {
         IDC_TTS_TEST_TEXT,
         IDC_TTS_TEST,
     };
-    for (int id : detailControls) {
+    const int screenReaderControls[] = {
+        IDC_STATIC_SCREEN_READER_TARGET,
+        IDC_SCREEN_READER_TARGET,
+        IDC_STATIC_SCREEN_READER_CHANNEL_NAME,
+        IDC_SCREEN_READER_CHANNEL_NAME,
+        IDC_STATIC_SCREEN_READER_CHANNEL_NOTE,
+    };
+    for (int id : sapiControls) {
         set_control_page_visible(wnd, id, !useScreenReader);
     }
+    for (int id : screenReaderControls) {
+        set_control_page_visible(wnd, id, useScreenReader);
+    }
+    update_screen_reader_channel_enabled_state(wnd);
 }
 
 static void show_settings_page(HWND wnd, int page) {
@@ -493,10 +699,12 @@ static void update_tts_test_text(HWND wnd) {
 
 static void init_tts_controls(HWND wnd) {
     CheckDlgButton(wnd, IDC_USE_SCREEN_READER, cfg_use_screen_reader.get() ? BST_CHECKED : BST_UNCHECKED);
-    SetWindowTextW(GetDlgItem(wnd, IDC_USE_SCREEN_READER), L"\u4f7f\u7528\u5c4f\u5e55\u9605\u8bfb\u5668");
+    SetWindowTextW(GetDlgItem(wnd, IDC_USE_SCREEN_READER), L"\u4f7f\u7528\u5c4f\u5e55\u9605\u8bfb\u5668(&R)");
     SetWindowTextW(GetDlgItem(wnd, IDC_TTS_VOICE), L"\u9009\u62e9\u8bed\u97f3");
     SetWindowTextW(GetDlgItem(wnd, IDC_TTS_RATE), L"\u8bed\u901f");
     SetWindowTextW(GetDlgItem(wnd, IDC_TTS_TEST_TEXT), L"\u8bd5\u542c\u6587\u672c");
+
+    init_screen_reader_channel_controls(wnd);
 
     HWND combo = GetDlgItem(wnd, IDC_TTS_VOICE);
     if (combo) {
@@ -556,6 +764,7 @@ static bool is_settings_edit_control(WORD id) {
     case IDC_TEMP_LRC_FOLDER:
     case IDC_TEMP_LRC_DELETE_DELAY_MS:
     case IDC_COPY_SPLIT_SEPARATORS:
+    case IDC_SCREEN_READER_CHANNEL_NAME:
     case IDC_TTS_TEST_TEXT:
         return true;
     default:
@@ -595,10 +804,12 @@ static void init_dialog(HWND wnd) {
 
     init_lrc_encoding_combo(wnd);
 
-    CheckDlgButton(wnd, IDC_DOWNLOAD_TO_LRC_FOLDER, cfg_download_to_lrc_folder.get() ? BST_CHECKED : BST_UNCHECKED);
-    SetWindowTextW(GetDlgItem(wnd, IDC_DOWNLOAD_TO_LRC_FOLDER), L"\u4e0b\u8f7d\u5230\u6307\u5b9a\u7684\u6b4c\u8bcd\u76ee\u5f55");
+    init_lyric_speak_mode_combo(wnd);
 
     init_copy_mode_controls(wnd);
+
+    CheckDlgButton(wnd, IDC_COPY_FILTER_LEADING_CREDITS, cfg_copy_filter_leading_credits.get() ? BST_CHECKED : BST_UNCHECKED);
+    SetWindowTextW(GetDlgItem(wnd, IDC_COPY_FILTER_LEADING_CREDITS), L"\u590d\u5236\u6b4c\u8bcd\u65f6\u8fc7\u6ee4\u7247\u5934\u7f72\u540d(&H)");
 
     int deleteDelayMs = static_cast<int>(cfg_temp_lrc_delete_delay_ms.get());
     if (deleteDelayMs < 0) deleteDelayMs = 0;
@@ -616,7 +827,57 @@ static void init_dialog(HWND wnd) {
 
 
 
-static void save_dialog(HWND wnd) {
+static INT_PTR CALLBACK restart_confirm_dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM) {
+    switch (msg) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+            EndDialog(wnd, LOWORD(wp));
+            return TRUE;
+        }
+        break;
+    case WM_CLOSE:
+        EndDialog(wnd, IDCANCEL);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static bool confirm_foobar_restart(HWND parent) {
+    INT_PTR result = DialogBoxParamW(core_api::get_my_instance(), MAKEINTRESOURCEW(IDD_RESTART_CONFIRM),
+        parent, restart_confirm_dialog_proc, 0);
+    return result == IDOK;
+}
+
+static bool execute_main_command_direct(const GUID& command) {
+    for (auto item : mainmenu_commands::enumerate()) {
+        const t_uint32 count = item->get_command_count();
+        for (t_uint32 index = 0; index < count; ++index) {
+            if (item->get_command(index) != command) continue;
+            try {
+                item->execute(index, service_ptr_t<service_base>());
+                return true;
+            } catch (...) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+static void queue_foobar_restart() {
+    fb2k::inMainThread([] {
+        speaklyrics_log_info(L"读屏通道设置：用户确认重启 foobar2000。");
+        if (execute_main_command_direct(standard_commands::guid_main_restart)) return;
+
+        speaklyrics_log_error(L"读屏通道设置：无法调用 foobar2000 官方重启命令。");
+        pfc::string8 message = pfc::stringcvt::string_utf8_from_wide(
+            L"无法自动重启 foobar2000，请手动退出并重新启动。");
+        pfc::string8 title = pfc::stringcvt::string_utf8_from_wide(L"朗读歌词");
+        popup_message::g_show(message.get_ptr(), title.get_ptr());
+    });
+}
+
+static bool save_dialog(HWND wnd) {
 
     BOOL ok = FALSE;
 
@@ -686,13 +947,17 @@ static void save_dialog(HWND wnd) {
 
     save_lrc_encoding_combo(wnd);
 
-    save_source_list(wnd);
+    save_lyric_speak_mode_combo(wnd);
 
-    cfg_download_to_lrc_folder = (IsDlgButtonChecked(wnd, IDC_DOWNLOAD_TO_LRC_FOLDER) == BST_CHECKED);
+    save_source_list(wnd);
 
     save_copy_mode_controls(wnd);
 
+    cfg_copy_filter_leading_credits = (IsDlgButtonChecked(wnd, IDC_COPY_FILTER_LEADING_CREDITS) == BST_CHECKED);
+
     cfg_use_screen_reader = (IsDlgButtonChecked(wnd, IDC_USE_SCREEN_READER) == BST_CHECKED);
+
+    bool channelProfilesChanged = save_screen_reader_channel_controls(wnd);
 
     cfg_tts_voice_type.set("sapi5");
 
@@ -700,6 +965,19 @@ static void save_dialog(HWND wnd) {
 
     cfg_tts_rate = current_tts_rate(wnd);
 
+    bool restartRequested = false;
+    if (!write_screen_reader_channel_config_files()) {
+        pfc::string8 message = pfc::stringcvt::string_utf8_from_wide(
+            L"\u8bfb\u5c4f\u901a\u9053\u914d\u7f6e\u65e0\u6cd5\u5199\u5165\u3002"
+            L"\u8bf7\u68c0\u67e5\u7ec4\u4ef6\u76ee\u5f55\u6743\u9650\uff1b\u4e89\u6e21\u901a\u9053\u540d\u79f0\u8bf7\u4f7f\u7528 GBK \u53ef\u8868\u793a\u7684\u5b57\u7b26\u3002");
+        popup_message::g_show(message.get_ptr(), "\xE6\x9C\x97\xE8\xAF\xBB\xE6\xAD\x8C\xE8\xAF\x8D");
+    } else if (channelProfilesChanged) {
+        restartRequested = confirm_foobar_restart(wnd);
+    }
+
+    if (!restartRequested) speech_preload();
+
+    return restartRequested;
 }
 
 
@@ -727,19 +1005,29 @@ static INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
 
         if (is_settings_edit_control(LOWORD(wp)) && HIWORD(wp) == EN_CHANGE) {
+            if (LOWORD(wp) == IDC_SCREEN_READER_CHANNEL_NAME) {
+                capture_screen_reader_channel_profile(wnd, g_current_screen_reader_target);
+            }
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_AUTO_SPEAK && HIWORD(wp) == BN_CLICKED) {
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_ANNOUNCE_TRACK && HIWORD(wp) == BN_CLICKED) {
             set_dialog_dirty(wnd, true);
-        } else if (LOWORD(wp) == IDC_DOWNLOAD_TO_LRC_FOLDER && HIWORD(wp) == BN_CLICKED) {
-            set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_COPY_MODE && HIWORD(wp) == CBN_SELCHANGE) {
+            set_dialog_dirty(wnd, true);
+        } else if (LOWORD(wp) == IDC_COPY_FILTER_LEADING_CREDITS && HIWORD(wp) == BN_CLICKED) {
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_USE_SCREEN_READER && HIWORD(wp) == BN_CLICKED) {
             update_tts_detail_visibility(wnd);
             set_dialog_dirty(wnd, true);
+        } else if (LOWORD(wp) == IDC_SCREEN_READER_TARGET && HIWORD(wp) == CBN_SELCHANGE) {
+            capture_screen_reader_channel_profile(wnd, g_current_screen_reader_target);
+            g_current_screen_reader_target = current_screen_reader_target(wnd);
+            load_screen_reader_channel_profile(wnd, g_current_screen_reader_target);
+            set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_LRC_ENCODING && HIWORD(wp) == CBN_SELCHANGE) {
+            set_dialog_dirty(wnd, true);
+        } else if (LOWORD(wp) == IDC_LYRIC_SPEAK_MODE && HIWORD(wp) == CBN_SELCHANGE) {
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_ANNOUNCE_TRACK_FORMAT && HIWORD(wp) == CBN_SELCHANGE) {
             set_dialog_dirty(wnd, true);
@@ -808,6 +1096,8 @@ static INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             save_copy_mode_controls(wnd);
 
+            speech_queue_speak(L"\u590d\u5236\u6b4c\u8bcd\u9ed8\u8ba4\u8bbe\u7f6e\u5df2\u4fdd\u5b58", true);
+
             return TRUE;
 
         case IDC_ABOUT_GITHUB_REPO:
@@ -836,15 +1126,27 @@ static INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case IDOK:
 
-            save_dialog(wnd);
+            {
+                bool restartRequested = save_dialog(wnd);
 
-            EndDialog(wnd, IDOK);
+                EndDialog(wnd, IDOK);
+
+                if (restartRequested) queue_foobar_restart();
+            }
 
             return TRUE;
 
         case IDC_APPLY_SETTINGS:
 
-            save_dialog(wnd);
+            {
+                bool restartRequested = save_dialog(wnd);
+
+                if (restartRequested) {
+                    EndDialog(wnd, IDOK);
+                    queue_foobar_restart();
+                    return TRUE;
+                }
+            }
 
             SetFocus(GetDlgItem(wnd, IDOK));
 

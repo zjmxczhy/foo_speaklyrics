@@ -1,5 +1,6 @@
 #include "stdafx.h"
 
+#include "config.h"
 #include "speaklyrics_log.h"
 #include "temp_lrc_manifest.h"
 
@@ -71,6 +72,25 @@ void clear_manifest_file(const std::wstring& manifestPath) {
     if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
 }
 
+bool is_safe_manifest_lrc_path(const std::wstring& path) {
+    if (path.empty()) return false;
+
+    pfc::string8 configuredFolder = cfg_temp_lrc_folder.get();
+    std::wstring tempFolder = expand_environment_path(utf8_to_wide(configuredFolder.get_ptr()));
+    if (tempFolder.empty()) return false;
+
+    std::filesystem::path filePath(path);
+    if (_wcsicmp(filePath.extension().c_str(), L".lrc") != 0 || !filePath.has_parent_path()) return false;
+
+    std::error_code error;
+    const std::filesystem::path canonicalFolder = std::filesystem::weakly_canonical(std::filesystem::path(tempFolder), error);
+    if (error) return false;
+    const std::filesystem::path canonicalParent = std::filesystem::weakly_canonical(filePath.parent_path(), error);
+    if (error) return false;
+
+    return _wcsicmp(canonicalParent.c_str(), canonicalFolder.c_str()) == 0;
+}
+
 }
 
 std::wstring temp_lrc_manifest_path() {
@@ -90,6 +110,10 @@ void temp_lrc_manifest_cleanup() {
 
     for (const auto& path : paths) {
         if (path.empty()) continue;
+        if (!is_safe_manifest_lrc_path(path)) {
+            speaklyrics_log_warning(L"Temporary lyric cleanup skipped an unsafe manifest path: %s.", path.c_str());
+            continue;
+        }
         DWORD attrs = GetFileAttributesW(path.c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) continue;
         if (DeleteFileW(path.c_str())) {

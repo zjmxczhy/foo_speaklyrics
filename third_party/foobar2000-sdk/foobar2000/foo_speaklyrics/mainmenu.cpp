@@ -19,6 +19,8 @@ static const GUID guid_cmd_settings = { 0x33c87fa3, 0x74d0, 0x4b84,{ 0x86, 0x16,
 
 static const GUID guid_cmd_toggle_auto = { 0xde9f9261, 0x3053, 0x4d09,{ 0x8f, 0xcf, 0x13, 0xcd, 0xda, 0x77, 0x12, 0x8e } };
 static const GUID guid_cmd_speak_current_track = { 0x1173812e, 0xd2a6, 0x46ba,{ 0xa8, 0x63, 0x28, 0x8d, 0xea, 0x9f, 0x40, 0x16 } };
+static const GUID guid_cmd_next_same_title_lyrics = { 0x1bc8021e, 0x8757, 0x4c46,{ 0x9f, 0x49, 0x3e, 0xb8, 0xb2, 0x97, 0x19, 0x61 } };
+static const GUID guid_cmd_previous_same_title_lyrics = { 0x4ca50481, 0xf22b, 0x4bf6,{ 0x83, 0x9e, 0xa2, 0xd7, 0x33, 0x87, 0x55, 0x40 } };
 
 static const GUID guid_cmd_load_file = { 0x929354bc, 0x62a8, 0x4bb7,{ 0x80, 0x3d, 0xa6, 0xe8, 0x5b, 0x1f, 0xac, 0xf3 } };
 
@@ -70,7 +72,7 @@ class speaklyrics_menu : public mainmenu_commands {
 
 public:
 
-    enum { cmd_settings, cmd_toggle_auto, cmd_speak_current_track, cmd_load_file, cmd_set_folder, cmd_set_temp_folder, cmd_search_lrc, cmd_add_timestamp_lrc, cmd_copy_plain_lyrics, cmd_jump_by_lyrics, cmd_total };
+    enum { cmd_settings, cmd_toggle_auto, cmd_speak_current_track, cmd_previous_same_title_lyrics, cmd_next_same_title_lyrics, cmd_load_file, cmd_set_folder, cmd_set_temp_folder, cmd_search_lrc, cmd_add_timestamp_lrc, cmd_copy_plain_lyrics, cmd_jump_by_lyrics, cmd_total };
 
 
 
@@ -87,6 +89,10 @@ public:
         case cmd_toggle_auto: return guid_cmd_toggle_auto;
 
         case cmd_speak_current_track: return guid_cmd_speak_current_track;
+
+        case cmd_previous_same_title_lyrics: return guid_cmd_previous_same_title_lyrics;
+
+        case cmd_next_same_title_lyrics: return guid_cmd_next_same_title_lyrics;
 
         case cmd_load_file: return guid_cmd_load_file;
 
@@ -116,6 +122,10 @@ public:
 
         case cmd_speak_current_track: set_utf8(out, L"\u67E5\u770B\u5F53\u524D\u64AD\u653E\u6B4C\u66F2\u4FE1\u606F"); break;
 
+        case cmd_previous_same_title_lyrics: set_utf8(out, L"\u5207\u6362\u5230\u4e0a\u4e00\u4e2a\u540c\u540d\u6b4c\u8bcd"); break;
+
+        case cmd_next_same_title_lyrics: set_utf8(out, L"\u5207\u6362\u5230\u4e0b\u4e00\u4e2a\u540c\u540d\u6b4c\u8bcd"); break;
+
         case cmd_load_file: set_utf8(out, L"\u52A0\u8F7D\u672C\u5730LRC\u6B4C\u8BCD(&L)"); break;
 
         case cmd_set_folder: set_utf8(out, L"\u8BBE\u7F6ELRC\u6B4C\u8BCD\u76EE\u5F55(&R)"); break;
@@ -143,6 +153,10 @@ public:
         case cmd_toggle_auto: set_utf8(out, L"\u5F00\u542F\u6216\u5173\u95ED\u81EA\u52A8\u6717\u8BFB\u6B4C\u8BCD\u3002"); return true;
 
         case cmd_speak_current_track: set_utf8(out, L"\u6309\u201C\u5207\u6362\u6B4C\u66F2\u64AD\u62A5\u5185\u5BB9\u201D\u7684\u8BBE\u7F6E\u64AD\u62A5\u5F53\u524D\u6B4C\u66F2\u4FE1\u606F\u3002"); return true;
+
+        case cmd_previous_same_title_lyrics: set_utf8(out, L"\u8054\u7f51\u67e5\u627e\u5e76\u52a0\u8f7d\u4e0a\u4e00\u4e2a\u540c\u6b4c\u540d\u5019\u9009\uff0c\u6210\u529f\u540e\u64ad\u62a5\u6b4c\u540d\u548c\u827a\u672f\u5bb6\u3002"); return true;
+
+        case cmd_next_same_title_lyrics: set_utf8(out, L"\u8054\u7f51\u67e5\u627e\u5e76\u52a0\u8f7d\u4e0b\u4e00\u4e2a\u540c\u6b4c\u540d\u5019\u9009\uff0c\u6210\u529f\u540e\u64ad\u62a5\u6b4c\u540d\u548c\u827a\u672f\u5bb6\u3002"); return true;
 
         case cmd_load_file: set_utf8(out, L"\u624B\u52A8\u9009\u62E9\u672C\u5730 LRC \u6B4C\u8BCD\u6587\u4EF6\u3002"); return true;
 
@@ -186,7 +200,7 @@ public:
 
             cfg_auto_speak = enabled;
 
-            speech_queue_speak(enabled ? L"LRC\u6717\u8bfb\u5df2\u6253\u5f00" : L"LRC\u6717\u8bfb\u5df2\u5173\u95ed", true);
+            speech_queue_auto_speak_state(enabled);
 
             break;
 
@@ -195,6 +209,18 @@ public:
         case cmd_speak_current_track:
 
             speak_current_track_announcement();
+
+            break;
+
+        case cmd_previous_same_title_lyrics:
+
+            switch_to_previous_same_title_lyrics();
+
+            break;
+
+        case cmd_next_same_title_lyrics:
+
+            switch_to_next_same_title_lyrics();
 
             break;
 

@@ -32,6 +32,8 @@ namespace LrcDownloader
                     return 0;
                 }
 
+                if (options.SelfTest) return RunSelfTests();
+
                 if (string.IsNullOrWhiteSpace(options.Title))
                 {
                     Console.Error.WriteLine("ERROR: --title is required.");
@@ -54,7 +56,10 @@ namespace LrcDownloader
 
                 Directory.CreateDirectory(options.OutDir);
 
-                var record = FindBestLyrics(options);
+                var queryOptions = BuildQueryOptions(options);
+                var record = options.CandidateIndex >= 0
+                    ? FindLyricsCandidate(queryOptions[0], options.CandidateIndex)
+                    : FindBestLyrics(queryOptions[0]);
                 if (record == null || string.IsNullOrWhiteSpace(record.SyncedLyrics))
                 {
                     Console.Error.WriteLine("NOT_FOUND: synced LRC lyrics were not found.");
@@ -71,6 +76,7 @@ namespace LrcDownloader
                 AppendManifest(options.ManifestPath, outputPath);
 
                 Console.WriteLine(outputPath);
+                Console.WriteLine("SELECTED:\t" + SafeTsv(record.TrackName) + "\t" + SafeTsv(record.ArtistName));
                 return 0;
             }
             catch (Exception ex)
@@ -83,7 +89,8 @@ namespace LrcDownloader
 
         private static void PrintSearchResults(Options options)
         {
-            var results = SearchAllSources(options);
+            var query = BuildQueryOptions(options)[0];
+            var results = SearchCandidateSources(query);
             foreach (var item in results)
             {
                 Console.WriteLine(SafeTsv(item.TrackName) + "\t" +
@@ -115,6 +122,86 @@ namespace LrcDownloader
             return DeduplicateResults(results);
         }
 
+        private static List<LyricsRecord> SearchCandidateSources(Options options)
+        {
+            var cached = TryLoadCandidateCache(options);
+            if (cached != null) return cached;
+
+            var results = SearchAllSources(options);
+            SaveCandidateCache(options, results);
+            return results;
+        }
+
+        private static List<LyricsRecord> TryLoadCandidateCache(Options options)
+        {
+            if (string.IsNullOrWhiteSpace(options.CandidateCachePath) || !File.Exists(options.CandidateCachePath)) return null;
+            try
+            {
+                var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var cache = serializer.Deserialize<CandidateCache>(File.ReadAllText(options.CandidateCachePath, Encoding.UTF8));
+                if (cache == null || cache.Records == null) return null;
+                if (DateTime.UtcNow.Ticks - cache.CreatedUtcTicks > TimeSpan.FromMinutes(30).Ticks) return null;
+                if (!string.Equals(cache.Title, NormalizeForMatch(options.Title), StringComparison.Ordinal) ||
+                    !string.Equals(cache.Artist, options.TitleOnly ? string.Empty : NormalizeForMatch(options.Artist), StringComparison.Ordinal) ||
+                    !string.Equals(cache.Album, NormalizeForMatch(options.Album), StringComparison.Ordinal) ||
+                    !string.Equals(cache.Sources, NormalizeSources(options.Sources), StringComparison.Ordinal) ||
+                    cache.DurationSeconds != options.DurationSeconds || cache.TitleOnly != options.TitleOnly) return null;
+                return cache.Records;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static void SaveCandidateCache(Options options, List<LyricsRecord> records)
+        {
+            if (string.IsNullOrWhiteSpace(options.CandidateCachePath) || records == null) return;
+            try
+            {
+                var directory = Path.GetDirectoryName(options.CandidateCachePath);
+                if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+                var cache = new CandidateCache
+                {
+                    Title = NormalizeForMatch(options.Title),
+                    Artist = options.TitleOnly ? string.Empty : NormalizeForMatch(options.Artist),
+                    Album = NormalizeForMatch(options.Album),
+                    Sources = NormalizeSources(options.Sources),
+                    DurationSeconds = options.DurationSeconds,
+                    TitleOnly = options.TitleOnly,
+                    CreatedUtcTicks = DateTime.UtcNow.Ticks,
+                    Records = records
+                };
+                var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var temporaryPath = options.CandidateCachePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                File.WriteAllText(temporaryPath, serializer.Serialize(cache), new UTF8Encoding(false));
+                try
+                {
+                    if (File.Exists(options.CandidateCachePath)) File.Delete(options.CandidateCachePath);
+                    File.Move(temporaryPath, options.CandidateCachePath);
+                }
+                finally
+                {
+                    if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static string NormalizeSources(string sources)
+        {
+            var parts = new List<string>();
+            foreach (var raw in (sources ?? string.Empty).Split(','))
+            {
+                var part = (raw ?? string.Empty).Trim().ToLowerInvariant();
+                if (part.Length > 0 && !parts.Contains(part)) parts.Add(part);
+            }
+            parts.Sort(StringComparer.Ordinal);
+            return string.Join(",", parts.ToArray());
+        }
+
         private static void TryAppendSearchResults(List<LyricsRecord> target, Func<List<LyricsRecord>> search, string sourceKey, string sourceName, Options options)
         {
             try
@@ -122,6 +209,7 @@ namespace LrcDownloader
                 foreach (var item in search())
                 {
                     if (item == null || string.IsNullOrWhiteSpace(item.TrackName)) continue;
+                    if (!IsAcceptableCandidate(item, options)) continue;
                     item.SourceKey = sourceKey;
                     item.SourceDisplayName = sourceName;
                     item.ScoreValue = Score(item, options);
@@ -166,12 +254,14 @@ namespace LrcDownloader
                     !string.IsNullOrWhiteSpace(options.Album) && options.DurationSeconds > 0)
                 {
                     var exact = TryGetBySignature(options, cached: true);
-                    if (exact != null && !string.IsNullOrWhiteSpace(exact.SyncedLyrics)) return exact;
+                    if (exact != null && !string.IsNullOrWhiteSpace(exact.SyncedLyrics) &&
+                        IsAcceptableCandidate(exact, options) && LyricsHeaderMatchesRequest(exact.SyncedLyrics, options)) return exact;
 
                     if (!options.CachedOnly)
                     {
                         exact = TryGetBySignature(options, cached: false);
-                        if (exact != null && !string.IsNullOrWhiteSpace(exact.SyncedLyrics)) return exact;
+                        if (exact != null && !string.IsNullOrWhiteSpace(exact.SyncedLyrics) &&
+                            IsAcceptableCandidate(exact, options) && LyricsHeaderMatchesRequest(exact.SyncedLyrics, options)) return exact;
                     }
                 }
 
@@ -181,6 +271,8 @@ namespace LrcDownloader
                 foreach (var item in results)
                 {
                     if (string.IsNullOrWhiteSpace(item.SyncedLyrics)) continue;
+                    if (!IsAcceptableCandidate(item, options)) continue;
+                    if (!LyricsHeaderMatchesRequest(item.SyncedLyrics, options)) continue;
                     var score = Score(item, options);
                     if (score > bestScore)
                     {
@@ -209,6 +301,175 @@ namespace LrcDownloader
                 if (netease != null && !string.IsNullOrWhiteSpace(netease.SyncedLyrics)) return netease;
             }
 
+            return null;
+        }
+
+        private static List<Options> BuildQueryOptions(Options original)
+        {
+            var rawTitle = (original.Title ?? string.Empty).Trim();
+            var rawArtist = (original.Artist ?? string.Empty).Trim();
+            var preferredTitle = CleanTitleText(rawTitle);
+            var preferredArtist = IsSourceLikeArtist(rawArtist) ? string.Empty : CleanArtistText(rawArtist);
+
+            string extractedTitle;
+            string extractedArtist;
+            if (TryExtractExplicitArtist(rawTitle, out extractedTitle, out extractedArtist))
+            {
+                preferredTitle = extractedTitle;
+                preferredArtist = extractedArtist;
+            }
+            else if (TrySplitCombinedArtistTitle(rawTitle, rawArtist, out extractedTitle, out extractedArtist))
+            {
+                preferredTitle = extractedTitle;
+                preferredArtist = extractedArtist;
+            }
+
+            if (string.IsNullOrWhiteSpace(preferredTitle)) preferredTitle = rawTitle;
+            var hasArtist = !string.IsNullOrWhiteSpace(preferredArtist);
+            return new List<Options>
+            {
+                CloneOptions(original, preferredTitle, hasArtist ? preferredArtist : string.Empty, original.TitleOnly || !hasArtist)
+            };
+        }
+
+        private static Options CloneOptions(Options source, string title, string artist, bool titleOnly)
+        {
+            return new Options
+            {
+                Title = title,
+                Artist = artist,
+                Album = source.Album,
+                DurationSeconds = source.DurationSeconds,
+                OutDir = source.OutDir,
+                FileName = source.FileName,
+                ManifestPath = source.ManifestPath,
+                CandidateCachePath = source.CandidateCachePath,
+                Sources = source.Sources,
+                CachedOnly = source.CachedOnly,
+                SearchOnly = source.SearchOnly,
+                ListOnly = source.ListOnly,
+                SelfTest = source.SelfTest,
+                TitleOnly = titleOnly,
+                CandidateIndex = source.CandidateIndex,
+                Help = source.Help
+            };
+        }
+
+        private static bool TryExtractExplicitArtist(string rawTitle, out string title, out string artist)
+        {
+            title = string.Empty;
+            artist = string.Empty;
+            if (string.IsNullOrWhiteSpace(rawTitle)) return false;
+
+            var match = Regex.Match(rawTitle,
+                @"(?:^|[\s\u3000|_/])(?:艺术家|歌手|演唱|artist)\s*[:：]?\s*(?<artist>.+?)\s*$",
+                RegexOptions.IgnoreCase);
+            if (!match.Success || match.Index <= 0) return false;
+
+            title = CleanTitleText(rawTitle.Substring(0, match.Index));
+            artist = CleanArtistText(match.Groups["artist"].Value);
+            return title.Length > 0 && artist.Length > 0;
+        }
+
+        private static bool TrySplitCombinedArtistTitle(string rawTitle, string rawArtist, out string title, out string artist)
+        {
+            title = string.Empty;
+            artist = string.Empty;
+            if (string.IsNullOrWhiteSpace(rawTitle)) return false;
+
+            Match match = null;
+            if (string.IsNullOrWhiteSpace(rawArtist))
+                match = Regex.Match(rawTitle, @"^\s*(?<artist>.+?)\s+[-–—－]\s+(?<title>.+?)\s*$");
+            else if (IsSourceLikeArtist(rawArtist))
+                match = Regex.Match(rawTitle, @"^\s*(?<artist>[^-–—－]{1,80})[-–—－](?<title>.+?)\s*$");
+
+            if (match == null || !match.Success) return false;
+            title = CleanTitleText(match.Groups["title"].Value);
+            artist = CleanArtistText(match.Groups["artist"].Value);
+            return title.Length > 0 && artist.Length > 0;
+        }
+
+        private static string CleanTitleText(string value)
+        {
+            value = (value ?? string.Empty).Trim();
+            value = Regex.Replace(value, @"\.(?:mp3|flac|wav|ape|m4a|aac|ogg|wma)$", string.Empty, RegexOptions.IgnoreCase);
+            value = Regex.Replace(value, @"^\s*\d{1,3}\s*[._-]+\s*", string.Empty);
+            value = Regex.Replace(value,
+                @"[\s·・\-–—]*《[^》]+》\s*(?:(?:电影|电视剧|网络剧|网剧|动画|动漫|游戏)\s*)?(?:主题曲|片尾曲|片头曲|插曲|推广曲|宣传曲|原声带?)?\s*$",
+                string.Empty, RegexOptions.IgnoreCase);
+            value = Regex.Replace(value,
+                @"\s*(?:(?:电影|电视剧|网络剧|网剧|动画|动漫|游戏)\s*)?(?:主题曲|片尾曲|片头曲|插曲|推广曲|宣传曲)\s*$",
+                string.Empty, RegexOptions.IgnoreCase);
+            value = Regex.Replace(value,
+                @"[\s_-]*(?:[\(（\[【]\s*)?(?:instrumental|伴奏|karaoke|off\s*vocal|无和声|纯音乐)(?:\s*[\)）\]】])?\s*$",
+                string.Empty, RegexOptions.IgnoreCase);
+            return value.Trim(' ', '\t', '\u3000', '_', '-', '\u2013', '\u2014', '\u00B7', '\u30FB');
+        }
+
+        private static string CleanArtistText(string value)
+        {
+            value = (value ?? string.Empty).Trim();
+            value = Regex.Replace(value, @"\.(?:mp3|flac|wav|ape|m4a|aac|ogg|wma)$", string.Empty, RegexOptions.IgnoreCase);
+            value = Regex.Replace(value,
+                @"[\s_-]*(?:[\(（\[【]\s*)?(?:instrumental|伴奏|karaoke|off\s*vocal|无和声|纯音乐)(?:\s*[\)）\]】])?\s*$",
+                string.Empty, RegexOptions.IgnoreCase);
+            return value.Trim(' ', '\t', '\u3000', '_', '-', '\u2013', '\u2014');
+        }
+
+        private static bool IsSourceLikeArtist(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return false;
+            return Regex.IsMatch(value,
+                @"伴奏网|伴奏网站|伴奏下载|立体声伴奏|音乐下载|歌曲下载|音乐网|资源网|铃声网|mp3|www\.|https?://|\.(?:com|net|cn)\b",
+                RegexOptions.IgnoreCase);
+        }
+
+        private static LyricsRecord FindLyricsCandidate(Options options, int requestedIndex)
+        {
+            var validIndex = 0;
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var candidate in SearchCandidateSources(options))
+            {
+                var identity = NormalizeForMatch(candidate.TrackName) + "|" + NormalizeForMatch(candidate.ArtistName);
+                if (!seen.Add(identity)) continue;
+                try
+                {
+                    var resolved = ResolveSearchCandidate(candidate, options);
+                    if (resolved == null || string.IsNullOrWhiteSpace(resolved.SyncedLyrics)) continue;
+                    if (!LyricsHeaderMatchesRequest(resolved.SyncedLyrics, options)) continue;
+                    if (validIndex++ == requestedIndex) return resolved;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("WARN: candidate download failed: " + ex.Message);
+                }
+            }
+            return null;
+        }
+
+        private static LyricsRecord ResolveSearchCandidate(LyricsRecord candidate, Options options)
+        {
+            if (candidate == null) return null;
+            if (string.Equals(candidate.SourceKey, "lrclib", StringComparison.OrdinalIgnoreCase)) return candidate;
+            if (string.Equals(candidate.SourceKey, "qq1", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(candidate.SourceId)) candidate.SyncedLyrics = GetQqMusicLyric(candidate.SourceId);
+                if (string.IsNullOrWhiteSpace(candidate.SyncedLyrics)) candidate.SyncedLyrics = GetQqMusicLyricDownload(candidate);
+                return candidate;
+            }
+            if (string.Equals(candidate.SourceKey, "qq2", StringComparison.OrdinalIgnoreCase))
+            {
+                candidate.SyncedLyrics = GetQqMusicLyricFromPlayLyricInfo(candidate, options);
+                if (string.IsNullOrWhiteSpace(candidate.SyncedLyrics)) candidate.SyncedLyrics = GetQqMusicLyricDownload(candidate);
+                if (string.IsNullOrWhiteSpace(candidate.SyncedLyrics) && !string.IsNullOrWhiteSpace(candidate.SourceId))
+                    candidate.SyncedLyrics = GetQqMusicLyric(candidate.SourceId);
+                return candidate;
+            }
+            if (string.Equals(candidate.SourceKey, "netease", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(candidate.SourceId)) candidate.SyncedLyrics = GetNeteaseMusicLyric(candidate.SourceId);
+                return candidate;
+            }
             return null;
         }
 
@@ -263,23 +524,15 @@ namespace LrcDownloader
         private static LyricsRecord TryGetFromQqMusicLrcSource(Options options)
         {
             var candidates = SearchQqMusic(options);
-            LyricsRecord best = null;
-            var bestScore = int.MinValue;
-            foreach (var item in candidates)
+            candidates.Sort((left, right) => Score(right, options).CompareTo(Score(left, options)));
+            foreach (var candidate in candidates)
             {
-                var score = Score(item, options);
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    best = item;
-                }
+                if (!IsAcceptableCandidate(candidate, options)) continue;
+                if (!string.IsNullOrWhiteSpace(candidate.SourceId)) candidate.SyncedLyrics = GetQqMusicLyric(candidate.SourceId);
+                if (string.IsNullOrWhiteSpace(candidate.SyncedLyrics)) candidate.SyncedLyrics = GetQqMusicLyricDownload(candidate);
+                if (!string.IsNullOrWhiteSpace(candidate.SyncedLyrics) && LyricsHeaderMatchesRequest(candidate.SyncedLyrics, options)) return candidate;
             }
-
-            if (best == null) return null;
-
-            if (!string.IsNullOrWhiteSpace(best.SourceId)) best.SyncedLyrics = GetQqMusicLyric(best.SourceId);
-            if (string.IsNullOrWhiteSpace(best.SyncedLyrics)) best.SyncedLyrics = GetQqMusicLyricDownload(best);
-            return string.IsNullOrWhiteSpace(best.SyncedLyrics) ? null : best;
+            return null;
         }
 
         private static LyricsRecord TryGetFromQqMusicQrcSource(Options options)
@@ -290,13 +543,14 @@ namespace LrcDownloader
 
             foreach (var candidate in candidates)
             {
+                if (!IsAcceptableCandidate(candidate, options)) continue;
                 candidate.SyncedLyrics = GetQqMusicLyricFromPlayLyricInfo(candidate, options);
                 if (string.IsNullOrWhiteSpace(candidate.SyncedLyrics)) candidate.SyncedLyrics = GetQqMusicLyricDownload(candidate);
                 if (string.IsNullOrWhiteSpace(candidate.SyncedLyrics) && !string.IsNullOrWhiteSpace(candidate.SourceId))
                 {
                     candidate.SyncedLyrics = GetQqMusicLyric(candidate.SourceId);
                 }
-                if (!string.IsNullOrWhiteSpace(candidate.SyncedLyrics)) return candidate;
+                if (!string.IsNullOrWhiteSpace(candidate.SyncedLyrics) && LyricsHeaderMatchesRequest(candidate.SyncedLyrics, options)) return candidate;
             }
 
             return null;
@@ -309,9 +563,10 @@ namespace LrcDownloader
 
             foreach (var candidate in candidates)
             {
+                if (!IsAcceptableCandidate(candidate, options)) continue;
                 if (string.IsNullOrWhiteSpace(candidate.SourceId)) continue;
                 candidate.SyncedLyrics = GetNeteaseMusicLyric(candidate.SourceId);
-                if (!string.IsNullOrWhiteSpace(candidate.SyncedLyrics)) return candidate;
+                if (!string.IsNullOrWhiteSpace(candidate.SyncedLyrics) && LyricsHeaderMatchesRequest(candidate.SyncedLyrics, options)) return candidate;
             }
 
             return null;
@@ -448,8 +703,6 @@ namespace LrcDownloader
                 var doc = new XmlDocument { XmlResolver = null };
                 doc.LoadXml(body);
                 var songInfo = doc.GetElementsByTagName("songinfo");
-                var defaultTitle = DecodePercent(GetFirstCData(doc, "songname"));
-                var defaultArtist = DecodePercent(GetFirstCData(doc, "singer"));
                 foreach (XmlNode song in songInfo)
                 {
                     var idText = song.Attributes != null && song.Attributes["id"] != null ? song.Attributes["id"].Value : string.Empty;
@@ -458,9 +711,8 @@ namespace LrcDownloader
                     var title = DecodePercent(GetChildText(song, "name"));
                     var artist = DecodePercent(GetChildText(song, "singername"));
                     var album = DecodePercent(GetChildText(song, "albumname"));
-                    if (string.IsNullOrWhiteSpace(title)) title = defaultTitle;
-                    if (string.IsNullOrWhiteSpace(artist)) artist = defaultArtist;
                     if (string.IsNullOrWhiteSpace(title)) continue;
+                    if (!string.IsNullOrWhiteSpace(options.Artist) && string.IsNullOrWhiteSpace(artist)) continue;
 
                     results.Add(new LyricsRecord
                     {
@@ -644,6 +896,161 @@ namespace LrcDownloader
             return score;
         }
 
+        private static bool TitleMatches(string candidateTitle, string wantedTitle)
+        {
+            var candidate = NormalizeForMatch(candidateTitle);
+            var wanted = NormalizeForMatch(wantedTitle);
+            if (candidate.Length == 0 || wanted.Length == 0) return false;
+            if (candidate == wanted) return true;
+            return candidate.Length >= 2 && wanted.Length >= 2 && ContainsEither(candidate, wanted);
+        }
+
+        private static bool ArtistMatches(string candidateArtist, string wantedArtist)
+        {
+            var candidate = NormalizeForMatch(candidateArtist);
+            var wanted = NormalizeForMatch(wantedArtist);
+            if (candidate.Length == 0 || wanted.Length == 0) return false;
+            if (ContainsEither(candidate, wanted)) return true;
+
+            var parts = Regex.Split(wantedArtist ?? string.Empty, @"[/\uFF0F\u3001,&\uFF06\uFF0C;\uFF1B+]+|\b(?:feat|ft)\.?\b", RegexOptions.IgnoreCase);
+            foreach (var part in parts)
+            {
+                var normalized = NormalizeForMatch(part);
+                if (normalized.Length >= 2 && candidate.Contains(normalized)) return true;
+            }
+            return false;
+        }
+
+        private static bool IsAcceptableCandidate(LyricsRecord record, Options options)
+        {
+            if (record == null || !TitleMatches(record.TrackName, options.Title)) return false;
+            if (options.TitleOnly) return true;
+            if (string.IsNullOrWhiteSpace(options.Artist) || string.IsNullOrWhiteSpace(record.ArtistName)) return true;
+            if (ArtistMatches(record.ArtistName, options.Artist)) return true;
+
+            if (NormalizeForMatch(record.TrackName) == NormalizeForMatch(options.Title) &&
+                options.DurationSeconds > 0 && record.DurationSeconds > 0)
+            {
+                return Math.Abs(record.DurationSeconds - options.DurationSeconds) <= 5;
+            }
+            return false;
+        }
+
+        private static bool LyricsHeaderMatchesRequest(string lyrics, Options options)
+        {
+            if (string.IsNullOrWhiteSpace(lyrics)) return false;
+
+            var timedLineCount = Regex.Matches(lyrics, @"(?im)^\s*\[\d{1,3}:\d{2}(?:[\.:]\d{1,3})?\]").Count;
+            if (timedLineCount <= 2 && Regex.IsMatch(lyrics, @"\u7eaf\u97f3\u4e50|\u6ca1\u6709\u586b\u8bcd|\binstrumental\b", RegexOptions.IgnoreCase)) return false;
+
+            var titleTag = Regex.Match(lyrics, @"(?im)^\s*\[ti\s*:\s*([^\]]+)\]");
+            if (titleTag.Success && !TitleMatches(titleTag.Groups[1].Value, options.Title)) return false;
+
+            var timedLines = Regex.Matches(lyrics, @"(?im)^\s*\[(\d{1,3}):(\d{2})(?:[\.:]\d{1,3})?\]\s*(.*?)\s*$");
+            var inspectedLines = 0;
+            for (var lineIndex = 0; lineIndex < timedLines.Count; lineIndex++)
+            {
+                var match = timedLines[lineIndex];
+                if (++inspectedLines > 10) break;
+                int minutes;
+                int seconds;
+                if (!int.TryParse(match.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out minutes) ||
+                    !int.TryParse(match.Groups[2].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out seconds)) continue;
+                if (minutes * 60 + seconds > 30) break;
+
+                var text = match.Groups[3].Value.Trim();
+                var separator = Regex.Match(text, @"\s[-\u2013\u2014]\s");
+                if (!separator.Success || text.Length > 180) continue;
+
+                var left = text.Substring(0, separator.Index).Trim();
+                var right = text.Substring(separator.Index + separator.Length).Trim();
+                if (TitleMatches(left, options.Title) || TitleMatches(right, options.Title)) return true;
+
+                // A spaced dash can also be ordinary lyric punctuation. Treat it
+                // as a mismatching title header only when nearby credit fields
+                // confirm that this is actually the metadata block.
+                var lastLookAhead = Math.Min(timedLines.Count - 1, lineIndex + 3);
+                for (var nextIndex = lineIndex + 1; nextIndex <= lastLookAhead; nextIndex++)
+                {
+                    var nextText = timedLines[nextIndex].Groups[3].Value.Trim();
+                    if (Regex.IsMatch(nextText,
+                        @"^(?:作词|作詞|词|詞|作曲|曲|编曲|編曲|演唱|歌手|artist|lyrics?|music|composer|vocal)\s*[:\uFF1A\u2236]",
+                        RegexOptions.IgnoreCase)) return false;
+                }
+            }
+            return true;
+        }
+
+        private static int RunSelfTests()
+        {
+            var failed = 0;
+            Action<bool, string> check = (condition, name) =>
+            {
+                if (condition) Console.WriteLine("PASS: " + name);
+                else
+                {
+                    Console.Error.WriteLine("FAIL: " + name);
+                    failed++;
+                }
+            };
+
+            var options = new Options { Title = "手掌", Artist = "盛宇D-SHINE/加木" };
+            check(LyricsHeaderMatchesRequest(
+                "[00:00.00]手掌 (Live) - 盛宇D-SHINE/加木\n[00:01.00]作词：测试\n[00:05.00]这是正文", options),
+                "matching title header is accepted");
+            check(!LyricsHeaderMatchesRequest(
+                "[00:00.00]小さな手のひら\n[00:01.00]いつかは誰かを包み込む\n[00:02.00]大きな手のひら\n[00:03.00]手のひら - 渡り廊下走り隊\n[00:04.00]詞∶カシアス島田\n[00:05.00]曲∶Voice of Mind", options),
+                "mismatching delayed title header is rejected");
+            check(!LyricsHeaderMatchesRequest("[00:00.00]纯音乐，请欣赏", options),
+                "instrumental placeholder is rejected");
+            check(LyricsHeaderMatchesRequest(
+                "[00:00.00]I walk - alone tonight\n[00:05.00]and wait for morning light\n[00:10.00]this is an ordinary lyric", options),
+                "ordinary lyric dash is not treated as a title header");
+
+            var correct = new LyricsRecord { TrackName = "手掌 (Live)", ArtistName = "盛宇D-SHINE/加木" };
+            var wrongArtist = new LyricsRecord { TrackName = "手掌", ArtistName = "渡り廊下走り隊" };
+            check(IsAcceptableCandidate(correct, options), "matching title and artist candidate is accepted");
+            check(!IsAcceptableCandidate(wrongArtist, options), "wrong artist candidate is rejected");
+            check(IsAcceptableCandidate(wrongArtist, new Options { Title = "手掌", TitleOnly = true }),
+                "title-only candidate switching accepts another artist");
+
+            var explicitMetadataQueries = BuildQueryOptions(new Options
+            {
+                Title = "问花·《白蛇2：青蛇劫起》电影主题曲　艺术家周深_instrumental",
+                Artist = string.Empty
+            });
+            check(explicitMetadataQueries.Count > 0 && explicitMetadataQueries[0].Title == "问花" &&
+                  explicitMetadataQueries[0].Artist == "周深" && !explicitMetadataQueries[0].TitleOnly,
+                "embedded artist metadata is extracted before title-only fallback");
+
+            var sourceMetadataQueries = BuildQueryOptions(new Options
+            {
+                Title = "莫艳琳-带走",
+                Artist = "超级星立体声伴奏网"
+            });
+            check(sourceMetadataQueries.Count > 0 && sourceMetadataQueries[0].Title == "带走" &&
+                  sourceMetadataQueries[0].Artist == "莫艳琳" && !sourceMetadataQueries[0].TitleOnly,
+                "source-site artist metadata is replaced by combined title pair");
+
+            var normalMetadataQueries = BuildQueryOptions(new Options { Title = "情歌", Artist = "梁静茹" });
+            check(normalMetadataQueries.Count > 0 && normalMetadataQueries[0].Title == "情歌" &&
+                  normalMetadataQueries[0].Artist == "梁静茹" && !normalMetadataQueries[0].TitleOnly,
+                "normal title and artist pair remains the first query");
+            var switchQueries = BuildQueryOptions(new Options { Title = "情歌", Artist = "梁静茹", TitleOnly = true });
+            check(switchQueries.Count > 0 && switchQueries[0].TitleOnly,
+                "same-title candidate switching preserves title-only matching");
+            check(!LooksLikeMojibake("你好吗？今天很好。"), "normal Chinese punctuation is not mojibake");
+            check(LooksLikeMojibake("姝岃瘝鏃堕棿"), "known GBK mojibake sequence is detected");
+
+            if (failed == 0)
+            {
+                Console.WriteLine("SELF_TEST_OK");
+                return 0;
+            }
+            Console.Error.WriteLine("SELF_TEST_FAILED: " + failed.ToString(CultureInfo.InvariantCulture));
+            return 3;
+        }
+
         private static string HttpGet(string url)
         {
             var request = (HttpWebRequest)WebRequest.Create(url);
@@ -702,9 +1109,13 @@ namespace LrcDownloader
                 else if (arg == "--file-name") options.FileName = Next(args, ref i, arg);
                 else if (arg == "--manifest") options.ManifestPath = Next(args, ref i, arg);
                 else if (arg == "--duration") options.DurationSeconds = ParseDuration(Next(args, ref i, arg));
+                else if (arg == "--candidate-index") options.CandidateIndex = ParseCandidateIndex(Next(args, ref i, arg));
+                else if (arg == "--candidate-cache") options.CandidateCachePath = Next(args, ref i, arg);
                 else if (arg == "--cached-only") options.CachedOnly = true;
                 else if (arg == "--search-only") options.SearchOnly = true;
+                else if (arg == "--title-only") options.TitleOnly = true;
                 else if (arg == "--list") options.ListOnly = true;
+                else if (arg == "--self-test") options.SelfTest = true;
                 else throw new ArgumentException("Unknown argument: " + arg);
             }
             return options;
@@ -741,6 +1152,14 @@ namespace LrcDownloader
                 return Math.Max(0, (int)Math.Round(ts.TotalSeconds));
             }
             throw new ArgumentException("Invalid --duration value: " + value);
+        }
+
+        private static int ParseCandidateIndex(string value)
+        {
+            int index;
+            if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out index) || index < 0)
+                throw new ArgumentException("Invalid --candidate-index value: " + value);
+            return index;
         }
 
         private static string Url(string value)
@@ -1045,12 +1464,13 @@ namespace LrcDownloader
         private static bool LooksLikeMojibake(string value)
         {
             if (string.IsNullOrEmpty(value)) return false;
-            var count = 0;
-            foreach (var ch in value)
-            {
-                if (ch == '?' || ch == '?' || ch == '?' || ch == '?' || ch == '?' || ch == '?' || ch == '?' || ch == '?' || ch == '?') count++;
-            }
-            return count > 0 || Regex.IsMatch(value, @"[閸?榭縘{2,}");
+            if (value.IndexOf('\uFFFD') >= 0 || value.Contains("锟斤拷")) return true;
+
+            // These combinations are common when UTF-8 bytes were decoded as
+            // GBK/GB18030. Requiring a sequence avoids treating normal Chinese
+            // question marks or an isolated uncommon character as corruption.
+            return Regex.IsMatch(value,
+                @"(?:鈥[斺濈潃]|銆[併傘]|锛[屼岋紒]|閸[欙紝]|[閸榭縘]{2,}|鐨勪|浣犵殑|姝岃瘝|鏃堕棿)");
         }
 
         private static string BuildNeteaseArtistText(object[] artists)
@@ -1194,7 +1614,11 @@ namespace LrcDownloader
             Console.WriteLine("  --sources     Comma separated lyric sources: lrclib,qq1,qq2,netease. Empty means no online download. qq and 163 are compatibility aliases.");
             Console.WriteLine("  --cached-only Do not call LRCLIB external lookup endpoint.");
             Console.WriteLine("  --search-only Skip exact signature lookup and only use search.");
+            Console.WriteLine("  --candidate-index <n> Download the zero-based matching search candidate.");
+            Console.WriteLine("  --candidate-cache <path> Reuse a short-lived same-title candidate list cache.");
+            Console.WriteLine("  --title-only  Match candidates by title without requiring the artist.");
             Console.WriteLine("  --list        Search and print tab-separated results without downloading.");
+            Console.WriteLine("  --self-test   Run deterministic matching regression tests.");
             Console.WriteLine("Exit codes: 0 success, 1 not found, 2 bad arguments, 3 error.");
         }
 
@@ -1207,15 +1631,20 @@ namespace LrcDownloader
             public string OutDir;
             public string FileName;
             public string ManifestPath;
+            public string CandidateCachePath;
             public string Sources = "lrclib,qq1";
             public bool CachedOnly;
             public bool SearchOnly;
             public bool ListOnly;
+            public bool SelfTest;
+            public bool TitleOnly;
+            public int CandidateIndex = -1;
             public bool Help;
         }
 
         private sealed class LyricsRecord
         {
+            public LyricsRecord() { }
             public string TrackName;
             public string ArtistName;
             public string AlbumName;
@@ -1263,6 +1692,19 @@ namespace LrcDownloader
                 try { return Convert.ToBoolean(value, CultureInfo.InvariantCulture); }
                 catch { return false; }
             }
+        }
+
+        private sealed class CandidateCache
+        {
+            public CandidateCache() { }
+            public string Title;
+            public string Artist;
+            public string Album;
+            public string Sources;
+            public int DurationSeconds;
+            public bool TitleOnly;
+            public long CreatedUtcTicks;
+            public List<LyricsRecord> Records;
         }
     }
 }

@@ -40,6 +40,10 @@
 !third_party/tolk-with-zdsr/x64/*.dll
 !third_party/tolk-with-zdsr/x86/*.dll
 
+# Generated copies; canonical channel configuration lives in tolk-with-zdsr.
+/third_party/tolk/libs/x64/byctrl.conf
+/third_party/tolk/libs/x86/byctrl.conf
+
 # Exclude the separate M3U importer component
 /build_m3u_importer.ps1
 /package_m3u_importer.ps1

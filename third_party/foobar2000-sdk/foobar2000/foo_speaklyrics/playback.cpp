@@ -4,6 +4,7 @@
 
 #include "lrc_parser.h"
 #include "playback.h"
+#include "lyrics_copy.h"
 #include "lyrics_jump_window.h"
 
 #include "speech_engine.h"
@@ -17,6 +18,12 @@ namespace {
 lrc_document g_doc;
 
 int g_last_spoken = -1;
+
+std::atomic_bool g_same_title_switch_in_progress{ false };
+int g_same_title_candidate_index = 0;
+std::wstring g_same_title_candidate_cache_path;
+std::wstring g_same_title_candidate_cache_key;
+std::wstring g_same_title_prefetch_requested_key;
 
 bool g_paused = false;
 
@@ -42,6 +49,9 @@ struct pending_temp_lrc_delete {
 };
 
 std::vector<pending_temp_lrc_delete> g_pending_temp_lrc_deletes;
+
+void cancel_pending_temp_lrc_delete(const std::wstring& path);
+void schedule_current_temp_lrc_delete();
 
 
 
@@ -153,6 +163,68 @@ std::wstring command_line_quote(const std::wstring& value) {
 
 }
 
+bool run_process_capture_stdout(const std::wstring& command, const fs::path& workDir, std::string& stdoutText, DWORD& exitCode) {
+    stdoutText.clear();
+    exitCode = 3;
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE readPipe = nullptr;
+    HANDLE writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) return false;
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = writePipe;
+    si.hStdError = writePipe;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi = {};
+    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+    mutableCommand.push_back(L'\0');
+    BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr, workDir.c_str(), &si, &pi);
+    CloseHandle(writePipe);
+    if (!ok) {
+        CloseHandle(readPipe);
+        return false;
+    }
+
+    char buffer[4096];
+    DWORD read = 0;
+    while (ReadFile(readPipe, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
+        stdoutText.append(buffer, buffer + read);
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(readPipe);
+    return true;
+}
+
+void parse_candidate_downloader_output(const std::string& output, std::wstring& path, std::wstring& title, std::wstring& artist) {
+    std::wstring text = utf8_to_wide(output.c_str());
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t end = text.find_first_of(L"\r\n", start);
+        std::wstring line = text.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+        if (line.rfind(L"SELECTED:\t", 0) == 0) {
+            size_t titleStart = 10;
+            size_t artistStart = line.find(L'\t', titleStart);
+            title = line.substr(titleStart, artistStart == std::wstring::npos ? std::wstring::npos : artistStart - titleStart);
+            if (artistStart != std::wstring::npos) artist = line.substr(artistStart + 1);
+        } else if (line.size() >= 4 && _wcsicmp(line.c_str() + line.size() - 4, L".lrc") == 0) {
+            path = line;
+        }
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+        if (start < text.size() && text[start - 1] == L'\r' && text[start] == L'\n') ++start;
+    }
+}
+
 
 
 std::wstring meta_value(const file_info_impl& info, const char* name) {
@@ -161,6 +233,61 @@ std::wstring meta_value(const file_info_impl& info, const char* name) {
 
     return value && *value ? utf8_to_wide(value) : std::wstring();
 
+}
+
+std::wstring trim_text(std::wstring text) {
+    while (!text.empty() && iswspace(text.front())) text.erase(text.begin());
+    while (!text.empty() && iswspace(text.back())) text.pop_back();
+    return text;
+}
+
+std::wstring lowercase_text(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(towlower(ch));
+    });
+    return text;
+}
+
+bool looks_like_download_source_artist(const std::wstring& artist) {
+    const std::wstring normalized = lowercase_text(trim_text(artist));
+    if (normalized.empty()) return false;
+
+    static const wchar_t* const markers[] = {
+        L"伴奏网", L"伴奏网站", L"伴奏下载", L"立体声伴奏",
+        L"音乐下载", L"歌曲下载", L"音乐网", L"音乐网站",
+        L"资源网", L"铃声网", L"mp3", L"www.", L"http://", L"https://",
+        L".com", L".net", L".cn"
+    };
+    for (const wchar_t* marker : markers) {
+        if (normalized.find(marker) != std::wstring::npos) return true;
+    }
+    return false;
+}
+
+bool split_combined_artist_title(const std::wstring& value, std::wstring& artist, std::wstring& title) {
+    static const wchar_t separators[] = { L'-', L'\uFF0D', L'\u2013', L'\u2014' };
+    for (wchar_t separator : separators) {
+        size_t start = 0;
+        while (start < value.size()) {
+            const size_t at = value.find(separator, start);
+            if (at == std::wstring::npos) break;
+            std::wstring left = trim_text(value.substr(0, at));
+            std::wstring right = trim_text(value.substr(at + 1));
+            if (!left.empty() && !right.empty()) {
+                artist = std::move(left);
+                title = std::move(right);
+                return true;
+            }
+            start = at + 1;
+        }
+    }
+    return false;
+}
+
+bool same_metadata_text(const std::wstring& first, const std::wstring& second) {
+    const std::wstring a = lowercase_text(trim_text(first));
+    const std::wstring b = lowercase_text(trim_text(second));
+    return !a.empty() && a == b;
 }
 
 
@@ -174,6 +301,12 @@ struct downloader_track_info {
     std::wstring album;
 
     int duration_seconds = 0;
+
+    bool metadata_corrected = false;
+
+    std::wstring original_title;
+
+    std::wstring original_artist;
 
 };
 
@@ -215,16 +348,110 @@ downloader_track_info get_downloader_track_info(metadb_handle_ptr track) {
 
     }
 
+    // Some accompaniment files keep the real song title only in the file name.
+    // Treat either a three-field placeholder collision, or a source-site title
+    // with no artist, as strong evidence that the local file name is better.
+    const bool repeatedPlaceholder = same_metadata_text(out.title, out.artist) && same_metadata_text(out.title, out.album);
+    const bool sourceTitleWithoutArtist = out.artist.empty() && looks_like_download_source_artist(out.title);
+    if (repeatedPlaceholder || sourceTitleWithoutArtist) {
+        if (auto path = local_track_path(track)) {
+            std::wstring fileTitle = trim_text(fs::path(*path).stem().wstring());
+            if (!fileTitle.empty() && !same_metadata_text(fileTitle, out.title)) {
+                out.original_title = out.title;
+                out.original_artist = out.artist;
+                out.title = std::move(fileTitle);
+                out.artist.clear();
+                out.album.clear();
+                out.metadata_corrected = true;
+            }
+        }
+    }
+
+    if (!out.metadata_corrected && looks_like_download_source_artist(out.artist)) {
+        std::wstring correctedArtist;
+        std::wstring correctedTitle;
+        if (split_combined_artist_title(out.title, correctedArtist, correctedTitle)) {
+            out.original_title = out.title;
+            out.original_artist = out.artist;
+            out.title = std::move(correctedTitle);
+            out.artist = std::move(correctedArtist);
+            out.metadata_corrected = true;
+        }
+    }
+
 
 
     return out;
 
 }
 
-std::wstring trim_text(std::wstring text) {
-    while (!text.empty() && iswspace(text.front())) text.erase(text.begin());
-    while (!text.empty() && iswspace(text.back())) text.pop_back();
-    return text;
+void clear_same_title_candidate_cache() {
+    if (!g_same_title_candidate_cache_path.empty()) {
+        std::error_code error;
+        fs::remove(g_same_title_candidate_cache_path, error);
+    }
+    g_same_title_candidate_cache_path.clear();
+    g_same_title_candidate_cache_key.clear();
+    g_same_title_prefetch_requested_key.clear();
+}
+
+std::wstring same_title_candidate_cache_path(const std::wstring& key) {
+    if (key.empty()) return std::wstring();
+    if (g_same_title_candidate_cache_key == key && !g_same_title_candidate_cache_path.empty()) {
+        return g_same_title_candidate_cache_path;
+    }
+
+    clear_same_title_candidate_cache();
+    std::error_code error;
+    fs::path folder = fs::temp_directory_path(error);
+    if (error || folder.empty()) return std::wstring();
+    const size_t keyHash = std::hash<std::wstring>{}(key);
+    fs::path path = folder / (L"foo_speaklyrics-candidates-" + std::to_wstring(static_cast<unsigned long long>(keyHash)) + L".json");
+    g_same_title_candidate_cache_key = key;
+    g_same_title_candidate_cache_path = path.wstring();
+    return g_same_title_candidate_cache_path;
+}
+
+void maybe_prefetch_same_title_candidates(metadb_handle_ptr track) {
+    if (track.is_empty()) return;
+    downloader_track_info info = get_downloader_track_info(track);
+    if (!info.artist.empty() && !info.metadata_corrected) return;
+
+    const std::wstring key = track_key(track);
+    if (key.empty() || g_same_title_prefetch_requested_key == key) return;
+    const std::wstring cachePath = same_title_candidate_cache_path(key);
+    const std::wstring sources = cfg_path_wide(cfg_lyric_sources);
+    fs::path exePath = fs::path(current_dll_dir()) / L"downloader" / L"LrcDownloader.exe";
+    if (cachePath.empty() || sources.empty() || info.title.empty() || !fs::exists(exePath)) return;
+
+    g_same_title_prefetch_requested_key = key;
+    std::wstring command = command_line_quote(exePath.wstring()) +
+        L" --title " + command_line_quote(info.title) +
+        L" --artist " + command_line_quote(info.artist) +
+        L" --album " + command_line_quote(info.album) +
+        L" --duration " + std::to_wstring(info.duration_seconds) +
+        L" --sources " + command_line_quote(sources) +
+        L" --search-only --title-only --list --candidate-cache " + command_line_quote(cachePath);
+
+    std::thread([command, exePath, key, cachePath]() {
+        std::string output;
+        DWORD exitCode = 3;
+        const bool started = run_process_capture_stdout(command, exePath.parent_path(), output, exitCode);
+        fb2k::inMainThread([key, cachePath, started, exitCode]() {
+            metadb_handle_ptr currentTrack;
+            if (!static_api_ptr_t<playback_control>()->get_now_playing(currentTrack) ||
+                track_key(currentTrack) != key || g_current_track_key != key) {
+                std::error_code error;
+                fs::remove(cachePath, error);
+                return;
+            }
+            if (started && exitCode == 0 && fs::exists(cachePath)) {
+                speaklyrics_log_info(L"同名歌词候选：已完成后台预取。");
+            } else {
+                speaklyrics_log_warning(L"同名歌词候选：后台预取未完成。");
+            }
+        });
+    }).detach();
 }
 
 std::wstring fallback_track_path_text(metadb_handle_ptr track) {
@@ -341,7 +568,9 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
 
 
-    std::wstring outputFolder = cfg_path_wide(cfg_download_to_lrc_folder.get() ? cfg_lrc_folder : cfg_temp_lrc_folder);
+    std::wstring permanentFolder = cfg_path_wide(cfg_lrc_folder);
+    bool temporaryDownload = trim_text(permanentFolder).empty();
+    std::wstring outputFolder = temporaryDownload ? cfg_path_wide(cfg_temp_lrc_folder) : permanentFolder;
 
     if (outputFolder.empty()) return;
 
@@ -392,9 +621,14 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
     }
 
+    if (info.metadata_corrected) {
+        speaklyrics_log_info(
+            L"自动下载：已纠正错误标签，原标题：%s，原艺术家：%s，改用标题：%s，艺术家：%s。",
+            info.original_title.c_str(), info.original_artist.c_str(), info.title.c_str(), info.artist.c_str());
+    }
 
 
-    bool temporaryDownload = !cfg_download_to_lrc_folder.get();
+
     std::wstring manifestPath = temporaryDownload ? temp_lrc_manifest_path() : L"";
 
     std::wstring command = command_line_quote(exePath.wstring()) +
@@ -415,45 +649,58 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
 
 
-    STARTUPINFOW si = {};
-
-    si.cb = sizeof(si);
-
-    si.dwFlags = STARTF_USESHOWWINDOW;
-
-    si.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION pi = {};
-
-    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
-
-    mutableCommand.push_back(L'\0');
-
-
-
-    BOOL ok = CreateProcessW(exePath.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
-
-        CREATE_NO_WINDOW, nullptr, exePath.parent_path().c_str(), &si, &pi);
-
-
-
     g_downloader_requested_track_key = key;
+    FB2K_console_formatter() << "foo_speaklyrics: started lrc downloader for " << pfc::stringcvt::string_utf8_from_wide(info.title.c_str()).get_ptr();
+    speaklyrics_log_info(L"自动下载：已启动下载器，标题：%s，艺术家：%s，来源：%s。", info.title.c_str(), info.artist.c_str(), sources.c_str());
 
-    if (ok) {
+    std::thread([command, exePath, key, temporaryDownload]() {
+        std::string output;
+        DWORD exitCode = 3;
+        const bool started = run_process_capture_stdout(command, exePath.parent_path(), output, exitCode);
+        std::wstring downloadedPath;
+        std::wstring selectedTitle;
+        std::wstring selectedArtist;
+        if (started && exitCode == 0) {
+            parse_candidate_downloader_output(output, downloadedPath, selectedTitle, selectedArtist);
+        }
 
-        CloseHandle(pi.hThread);
+        fb2k::inMainThread([key, temporaryDownload, started, exitCode, downloadedPath, selectedTitle, selectedArtist]() {
+            metadb_handle_ptr currentTrack;
+            if (!static_api_ptr_t<playback_control>()->get_now_playing(currentTrack) ||
+                track_key(currentTrack) != key) return;
 
-        CloseHandle(pi.hProcess);
+            if (!started) {
+                speaklyrics_log_error(L"自动下载：无法启动下载器。");
+                return;
+            }
+            if (exitCode != 0 || downloadedPath.empty() || !fs::exists(downloadedPath)) {
+                speaklyrics_log_warning(L"自动下载：未找到可用 LRC。");
+                return;
+            }
 
-        FB2K_console_formatter() << "foo_speaklyrics: started lrc downloader for " << pfc::stringcvt::string_utf8_from_wide(info.title.c_str()).get_ptr();
-        speaklyrics_log_info(L"自动下载：已启动下载器，标题：%s，艺术家：%s，来源：%s。", info.title.c_str(), info.artist.c_str(), sources.c_str());
+            lrc_document downloadedDocument;
+            pfc::string8 loadError;
+            if (!downloadedDocument.load(downloadedPath, loadError)) {
+                speaklyrics_log_error(L"歌词加载：下载的 LRC 解析失败：%s，文件：%s。",
+                    pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr(), downloadedPath.c_str());
+                return;
+            }
 
-    } else {
+            schedule_current_temp_lrc_delete();
+            g_doc = std::move(downloadedDocument);
+            g_current_lrc = downloadedPath;
+            g_current_lrc_temporary = temporaryDownload;
+            g_last_spoken = -1;
+            if (g_current_lrc_temporary) cancel_pending_temp_lrc_delete(g_current_lrc);
+            refresh_lyrics_jump_window();
 
-        FB2K_console_formatter() << "foo_speaklyrics: failed to start downloader, error " << static_cast<t_uint32>(GetLastError());
-        speaklyrics_log_error(L"自动下载：启动下载器失败，错误码：%lu。", GetLastError());
-
-    }
+            FB2K_console_formatter() << "foo_speaklyrics: loaded downloaded lrc "
+                << pfc::stringcvt::string_utf8_from_wide(downloadedPath.c_str()).get_ptr();
+            speaklyrics_log_info(L"歌词加载：已直接加载下载的 LRC：%s，标题：%s，艺术家：%s。",
+                downloadedPath.c_str(), selectedTitle.c_str(), selectedArtist.c_str());
+            maybe_prefetch_same_title_candidates(currentTrack);
+        });
+    }).detach();
 
 }
 
@@ -583,9 +830,13 @@ std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder, metad
 
         int score = 0;
 
-        if (!normalizedArtist.empty() && !normalizedTitle.empty() && contains_match_text(normalizedName, normalizedArtist) && contains_match_text(normalizedName, normalizedTitle)) {
+        if (!normalizedArtist.empty() && !normalizedTitle.empty()) {
 
-            score = 4;
+            // When an artist is known, never reuse another artist's same-title
+            // lyric from a shared folder. This keeps local matching consistent
+            // with downloader matching: title + artist first, title-only only
+            // when the artist is genuinely unavailable.
+            if (contains_match_text(normalizedName, normalizedArtist) && contains_match_text(normalizedName, normalizedTitle)) score = 4;
 
         } else if (!normalizedTitle.empty() && contains_match_text(normalizedName, normalizedTitle)) {
 
@@ -920,6 +1171,7 @@ void load_for_track(metadb_handle_ptr track) {
 
         FB2K_console_formatter() << "foo_speaklyrics: loaded " << pfc::stringcvt::string_utf8_from_wide(found->path.c_str()).get_ptr();
         speaklyrics_log_info(L"歌词加载：已加载 LRC：%s。", found->path.c_str());
+        maybe_prefetch_same_title_candidates(track);
 
     } else {
 
@@ -934,6 +1186,36 @@ void load_for_track(metadb_handle_ptr track) {
 
 
 
+bool is_cjk_speech_character(wchar_t ch) {
+    return (ch >= 0x3400 && ch <= 0x9fff) || (ch >= 0x3040 && ch <= 0x30ff) ||
+        (ch >= 0xac00 && ch <= 0xd7af);
+}
+
+int estimate_lyric_speech_ms(const std::wstring& text) {
+    int cjkCharacters = 0;
+    int latinWords = 0;
+    int punctuation = 0;
+    bool insideLatinWord = false;
+
+    for (wchar_t ch : text) {
+        if (is_cjk_speech_character(ch)) {
+            ++cjkCharacters;
+            insideLatinWord = false;
+        } else if (iswalnum(ch)) {
+            if (!insideLatinWord) ++latinWords;
+            insideLatinWord = true;
+        } else {
+            insideLatinWord = false;
+            if (iswpunct(ch)) ++punctuation;
+        }
+    }
+
+    // This is intentionally approximate: Tolk does not expose the active
+    // screen reader's speech rate or a reliable completion event.
+    int estimate = 400 + cjkCharacters * 180 + latinWords * 360 + punctuation * 90;
+    return (std::clamp)(estimate, 900, 6000);
+}
+
 void speak_for_time(double seconds) {
 
     if (!cfg_auto_speak.get() || g_paused || g_doc.empty()) return;
@@ -942,19 +1224,40 @@ void speak_for_time(double seconds) {
 
     int ms = static_cast<int>(seconds * 1000.0) - offset;
 
-    int index = g_doc.find_index_for_time(ms);
+    int currentIndex = g_doc.find_index_for_time(ms);
+    int spokenIndex = currentIndex;
+    pfc::string8 configuredMode = cfg_lyric_speak_mode.get();
+    const bool advanceMode = _stricmp(configuredMode.get_ptr(), "advance") == 0;
 
-    if (index < 0 || index == g_last_spoken) return;
+    if (advanceMode) {
+        std::vector<lyric_jump_item> items = filter_leading_lyric_credits(get_current_lyric_jump_items());
+        spokenIndex = -1;
+        for (size_t i = 0; i < items.size(); ++i) {
+            int speakTime = (std::max)(0, items[i].time_ms - estimate_lyric_speech_ms(items[i].text));
+            if (i > 0) speakTime = (std::max)(speakTime, items[i - 1].time_ms);
+            if (speakTime <= ms) spokenIndex = static_cast<int>(i);
+        }
+        if (spokenIndex < 0 || spokenIndex == g_last_spoken) return;
 
-    const lrc_line* line = g_doc.get(static_cast<size_t>(index));
+        const lyric_jump_item& item = items[static_cast<size_t>(spokenIndex)];
+        if (ms - item.time_ms > lyric_valid_ms()) return;
+        speech_queue_lyric(item.text.c_str(), true, static_cast<unsigned>(lyric_valid_ms()));
+        g_last_spoken = spokenIndex;
+        return;
+    } else {
+        if (currentIndex < 0) return;
+        const lrc_line* triggerLine = g_doc.get(static_cast<size_t>(currentIndex));
+        if (triggerLine && ms - triggerLine->time_ms > lyric_valid_ms()) return;
+    }
 
-    if (line && ms - line->time_ms > lyric_valid_ms()) return;
+    if (spokenIndex < 0 || spokenIndex == g_last_spoken) return;
+    const lrc_line* line = g_doc.get(static_cast<size_t>(spokenIndex));
 
     if (line && !line->text.empty()) {
 
-        speech_queue_speak(line->text.c_str(), true);
+        speech_queue_lyric(line->text.c_str(), true, static_cast<unsigned>(lyric_valid_ms()));
 
-        g_last_spoken = index;
+        g_last_spoken = spokenIndex;
 
     }
 
@@ -976,6 +1279,8 @@ public:
 
             play_callback::flag_on_playback_pause |
 
+            play_callback::flag_on_playback_edited |
+
             play_callback::flag_on_playback_time;
 
     }
@@ -983,6 +1288,8 @@ public:
     void on_playback_starting(play_control::t_track_command, bool) override {}
 
     void on_playback_new_track(metadb_handle_ptr p_track) override {
+
+        speech_invalidate_pending();
 
         g_paused = false;
 
@@ -1002,6 +1309,10 @@ public:
 
         g_downloader_requested_track_key.clear();
 
+        g_same_title_candidate_index = 0;
+        g_same_title_switch_in_progress = false;
+        clear_same_title_candidate_cache();
+
         load_for_track(p_track);
 
         bool announced = queue_or_speak_track_announcement(p_track);
@@ -1016,6 +1327,8 @@ public:
 
         g_downloader_requested_track_key.clear();
 
+        clear_same_title_candidate_cache();
+
         cancel_pending_track_announcement();
 
         speech_queue_silence();
@@ -1023,6 +1336,8 @@ public:
     }
 
     void on_playback_seek(double p_time) override {
+
+        speech_invalidate_pending();
 
         g_last_spoken = -1;
 
@@ -1041,7 +1356,28 @@ public:
 
     }
 
-    void on_playback_edited(metadb_handle_ptr) override {}
+    void on_playback_edited(metadb_handle_ptr p_track) override {
+
+        if (p_track.is_empty() || track_key(p_track) != g_current_track_key) return;
+
+        speech_invalidate_pending();
+
+        // Tag edits can supply the missing artist while the same song keeps
+        // playing. Drop any title-only temporary candidate and rerun matching
+        // immediately with foobar2000's updated metadata.
+        delete_current_temp_lrc();
+        clear_loaded_lrc();
+        g_last_missing_lrc_retry_time = -1000.0;
+        g_downloader_requested_track_key.clear();
+        g_same_title_candidate_index = 0;
+        g_same_title_switch_in_progress = false;
+        clear_same_title_candidate_cache();
+
+        downloader_track_info info = get_downloader_track_info(p_track);
+        speaklyrics_log_info(L"标签更新：重新匹配当前歌曲，标题：%s，艺术家：%s。", info.title.c_str(), info.artist.c_str());
+        load_for_track(p_track);
+
+    }
 
     void on_playback_dynamic_info(const file_info&) override {}
 
@@ -1114,6 +1450,115 @@ bool speak_current_track_announcement() {
     cancel_pending_track_announcement();
     speech_queue_speak(text.c_str(), true);
     return true;
+}
+
+bool switch_same_title_lyrics(int direction) {
+    if (g_same_title_switch_in_progress.exchange(true)) return false;
+
+    const bool previousDirection = direction < 0;
+    const int previousCandidateIndex = g_same_title_candidate_index;
+    const int candidateIndex = previousCandidateIndex + direction;
+    if (candidateIndex < 0) {
+        g_same_title_switch_in_progress = false;
+        speech_queue_speak(L"\u6ca1\u6709\u4e0a\u4e00\u4e2a\u540c\u540d\u6b4c\u8bcd", true);
+        return false;
+    }
+
+    metadb_handle_ptr track;
+    if (!static_api_ptr_t<playback_control>()->get_now_playing(track) || track.is_empty()) {
+        g_same_title_switch_in_progress = false;
+        speech_queue_speak(L"\u5f53\u524d\u6ca1\u6709\u6b63\u5728\u64ad\u653e\u7684\u6b4c\u66f2", true);
+        return false;
+    }
+
+    downloader_track_info info = get_downloader_track_info(track);
+    std::wstring sources = cfg_path_wide(cfg_lyric_sources);
+    std::wstring outputFolder = cfg_path_wide(cfg_temp_lrc_folder);
+    fs::path exePath = fs::path(current_dll_dir()) / L"downloader" / L"LrcDownloader.exe";
+    if (info.title.empty() || sources.empty() || outputFolder.empty() || !fs::exists(exePath)) {
+        g_same_title_switch_in_progress = false;
+        speech_queue_speak(L"\u65e0\u6cd5\u5207\u6362\u540c\u540d\u6b4c\u8bcd", true);
+        return false;
+    }
+
+    std::error_code error;
+    fs::create_directories(outputFolder, error);
+    if (error) {
+        g_same_title_switch_in_progress = false;
+        speech_queue_speak(L"\u65e0\u6cd5\u5207\u6362\u540c\u540d\u6b4c\u8bcd", true);
+        return false;
+    }
+
+    g_same_title_candidate_index = candidateIndex;
+    const std::wstring requestedTrackKey = track_key(track);
+    const std::wstring requestedTitle = info.title;
+    const std::wstring candidateCachePath = same_title_candidate_cache_path(requestedTrackKey);
+    std::wstring command = command_line_quote(exePath.wstring()) +
+        L" --title " + command_line_quote(info.title) +
+        L" --artist " + command_line_quote(info.artist) +
+        L" --album " + command_line_quote(info.album) +
+        L" --duration " + std::to_wstring(info.duration_seconds) +
+        L" --sources " + command_line_quote(sources) +
+        L" --out " + command_line_quote(outputFolder) +
+        L" --search-only --title-only --candidate-index " + std::to_wstring(candidateIndex);
+    if (!candidateCachePath.empty()) command += L" --candidate-cache " + command_line_quote(candidateCachePath);
+    std::wstring manifestPath = temp_lrc_manifest_path();
+    if (!manifestPath.empty()) command += L" --manifest " + command_line_quote(manifestPath);
+
+    std::thread([command, exePath, requestedTrackKey, requestedTitle, candidateIndex, previousCandidateIndex, previousDirection]() {
+        std::string output;
+        DWORD exitCode = 3;
+        bool started = run_process_capture_stdout(command, exePath.parent_path(), output, exitCode);
+        std::wstring path;
+        std::wstring title;
+        std::wstring artist;
+        if (started && exitCode == 0) parse_candidate_downloader_output(output, path, title, artist);
+
+        fb2k::inMainThread([requestedTrackKey, requestedTitle, candidateIndex, previousCandidateIndex, previousDirection, exitCode, path, title, artist]() {
+            g_same_title_switch_in_progress = false;
+
+            metadb_handle_ptr currentTrack;
+            if (!static_api_ptr_t<playback_control>()->get_now_playing(currentTrack) ||
+                track_key(currentTrack) != requestedTrackKey) return;
+
+            if (exitCode != 0 || path.empty() || !fs::exists(path)) {
+                g_same_title_candidate_index = previousCandidateIndex;
+                speaklyrics_log_warning(L"\u540c\u540d\u6b4c\u8bcd\u5207\u6362\uff1a\u672a\u627e\u5230\u5019\u9009\uff0c\u5e8f\u53f7\uff1a%d\u3002", candidateIndex);
+                speech_queue_speak(previousDirection ? L"\u6ca1\u6709\u627e\u5230\u4e0a\u4e00\u4e2a\u540c\u540d\u6b4c\u8bcd" : L"\u6ca1\u6709\u627e\u5230\u4e0b\u4e00\u4e2a\u540c\u540d\u6b4c\u8bcd", true);
+                return;
+            }
+
+            lrc_document candidateDocument;
+            pfc::string8 loadError;
+            if (!candidateDocument.load(path, loadError)) {
+                g_same_title_candidate_index = previousCandidateIndex;
+                speech_queue_speak(previousDirection ? L"\u6ca1\u6709\u627e\u5230\u4e0a\u4e00\u4e2a\u540c\u540d\u6b4c\u8bcd" : L"\u6ca1\u6709\u627e\u5230\u4e0b\u4e00\u4e2a\u540c\u540d\u6b4c\u8bcd", true);
+                return;
+            }
+
+            schedule_current_temp_lrc_delete();
+            g_doc = std::move(candidateDocument);
+            g_current_lrc = path;
+            g_current_lrc_temporary = true;
+            g_last_spoken = -1;
+            cancel_pending_temp_lrc_delete(g_current_lrc);
+            refresh_lyrics_jump_window();
+
+            std::wstring announcement = title.empty() ? requestedTitle : title;
+            if (!artist.empty()) announcement += L"\uff0c" + artist;
+            speaklyrics_log_info(L"\u540c\u540d\u6b4c\u8bcd\u5207\u6362\uff1a\u5df2\u52a0\u8f7d\uff0c\u6807\u9898\uff1a%s\uff0c\u827a\u672f\u5bb6\uff1a%s\u3002", announcement.c_str(), artist.c_str());
+            speech_queue_speak(announcement.c_str(), true);
+        });
+    }).detach();
+    return true;
+}
+
+bool switch_to_next_same_title_lyrics() {
+    return switch_same_title_lyrics(1);
+}
+
+bool switch_to_previous_same_title_lyrics() {
+    return switch_same_title_lyrics(-1);
 }
 
 void reload_current_lyrics() {

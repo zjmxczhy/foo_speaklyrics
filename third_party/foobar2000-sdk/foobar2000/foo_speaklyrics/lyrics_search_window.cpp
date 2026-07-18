@@ -272,8 +272,13 @@ bool has_enabled_sources() {
 }
 
 std::wstring output_folder_for_download(bool permanent) {
-    bool toLrcFolder = permanent || cfg_download_to_lrc_folder.get();
-    return expand_environment_path(toLrcFolder ? cfg_to_wide_local(cfg_lrc_folder) : cfg_to_wide_local(cfg_temp_lrc_folder));
+    std::wstring permanentFolder = trim_text(cfg_to_wide_local(cfg_lrc_folder));
+    bool toLrcFolder = permanent || !permanentFolder.empty();
+    return expand_environment_path(toLrcFolder ? permanentFolder : cfg_to_wide_local(cfg_temp_lrc_folder));
+}
+
+bool is_temporary_download(bool permanent) {
+    return !permanent && trim_text(cfg_to_wide_local(cfg_lrc_folder)).empty();
 }
 
 bool download_item_to_folder(const search_result_item& item, const std::wstring& folder, bool temporary, std::wstring& error) {
@@ -326,7 +331,7 @@ void start_download(size_t index, bool permanent) {
     if (index >= g_items.size() || g_items[index].placeholder) return;
     search_result_item item = g_items[index];
     std::wstring folder = output_folder_for_download(permanent);
-    bool temporary = !permanent && !cfg_download_to_lrc_folder.get();
+    bool temporary = is_temporary_download(permanent);
     std::thread([item, folder, temporary]() {
         auto payload = new download_done_payload();
         payload->ok = download_item_to_folder(item, folder, temporary, payload->error);
@@ -391,7 +396,7 @@ void start_search() {
         } else if (should_auto_download(payload->items.front())) {
             std::wstring error;
             std::wstring outputFolder = output_folder_for_download(false);
-            bool temporary = !cfg_download_to_lrc_folder.get();
+            bool temporary = is_temporary_download(false);
             if (!trim_text(outputFolder).empty() && download_item_to_folder(payload->items.front(), outputFolder, temporary, error)) {
                 payload->auto_downloaded = true;
             }

@@ -12,6 +12,9 @@ bool copy_text_to_clipboard(const std::wstring& text);
 
 bool speak_current_track_announcement();
 
+bool switch_to_next_same_title_lyrics();
+bool switch_to_previous_same_title_lyrics();
+
 struct lyric_jump_item {
     int time_ms = 0;
     std::wstring text;

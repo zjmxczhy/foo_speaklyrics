@@ -73,10 +73,6 @@ static bool decode_codepage(const char* data, int len, UINT codepage, bool stric
     if (len <= 0) return true;
     DWORD flags = strict ? MB_ERR_INVALID_CHARS : 0;
     int need = MultiByteToWideChar(codepage, flags, data, len, nullptr, 0);
-    if (need <= 0 && strict) {
-        flags = 0;
-        need = MultiByteToWideChar(codepage, flags, data, len, nullptr, 0);
-    }
     if (need <= 0) return false;
     out.assign(static_cast<size_t>(need), L'\0');
     int written = MultiByteToWideChar(codepage, flags, data, len, out.data(), need);

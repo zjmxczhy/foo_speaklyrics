@@ -2,6 +2,10 @@
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $DistRoot = Join-Path $Root "dist"
 $DownloaderOut = Join-Path $Root "build\LrcDownloader\Release"
+$MainSource = Get-Content (Join-Path $Root "third_party\foobar2000-sdk\foobar2000\foo_speaklyrics\main.cpp") -Raw -Encoding UTF8
+$VersionMatch = [regex]::Match($MainSource, 'DECLARE_COMPONENT_VERSION\([^,]+,\s*"([^"]+)"')
+if (-not $VersionMatch.Success) { throw "Unable to read component version from main.cpp." }
+$Version = $VersionMatch.Groups[1].Value
 
 function Require-File($Path) {
     if (-not (Test-Path $Path)) { throw "Missing file: $Path" }
@@ -32,6 +36,12 @@ function Copy-Payload($TargetDir, $ArchName, $ComponentPlatform) {
     Get-ChildItem $TolkLibDir -File | Where-Object { $_.Extension -in ".dll", ".ini", ".conf" } | ForEach-Object {
         Copy-Item $_.FullName $TolkTarget -Force
     }
+    $ZdsrLyricsChannelConfig = Join-Path $Root "third_party\tolk-with-zdsr\ZDSRAPI-lyrics-channel.ini"
+    Require-File $ZdsrLyricsChannelConfig
+    # ZDSRAPI parses this legacy configuration as ANSI. Writing UTF-8 here
+    # turns “朗读歌词通道” into mojibake such as “鏈楄姝岃瘝閫氶亾”.
+    $ZdsrText = [IO.File]::ReadAllText($ZdsrLyricsChannelConfig, [Text.Encoding]::UTF8)
+    [IO.File]::WriteAllText((Join-Path $TolkTarget "ZDSRAPI.ini"), $ZdsrText, [Text.Encoding]::GetEncoding(936))
     Copy-Downloader $TargetDir
 }
 
@@ -53,28 +63,24 @@ Remove-Item -Force `
     (Join-Path $DistRoot "foo_speaklyrics-x64.zip"), `
     (Join-Path $DistRoot "foo_speaklyrics-x86.zip") `
     -ErrorAction SilentlyContinue
+Get-ChildItem -LiteralPath $DistRoot -Filter "foo_speaklyrics*.fb2k-component" -File | Remove-Item -Force
 
 # Single-architecture packages keep files at package root.
 $ManualX64 = Join-Path $DistRoot "foo_speaklyrics-x64"
 Copy-Payload $ManualX64 "x64" "x64"
-Compress-Archive -Path (Join-Path $ManualX64 "*") -DestinationPath (Join-Path $DistRoot "foo_speaklyrics-x64.zip")
-Move-Item (Join-Path $DistRoot "foo_speaklyrics-x64.zip") (Join-Path $DistRoot "foo_speaklyrics-x64.fb2k-component") -Force
+$X64Zip = Join-Path $DistRoot "foo_speaklyrics-$Version-x64.zip"
+$X64Package = Join-Path $DistRoot "foo_speaklyrics-$Version-x64.fb2k-component"
+Compress-Archive -Path (Join-Path $ManualX64 "*") -DestinationPath $X64Zip
+Move-Item $X64Zip $X64Package -Force
 
 $ManualX86 = Join-Path $DistRoot "foo_speaklyrics-x86"
 Copy-Payload $ManualX86 "x86" "Win32"
-Compress-Archive -Path (Join-Path $ManualX86 "*") -DestinationPath (Join-Path $DistRoot "foo_speaklyrics-x86.zip")
-Move-Item (Join-Path $DistRoot "foo_speaklyrics-x86.zip") (Join-Path $DistRoot "foo_speaklyrics-x86.fb2k-component") -Force
+$X86Zip = Join-Path $DistRoot "foo_speaklyrics-$Version-x86.zip"
+$X86Package = Join-Path $DistRoot "foo_speaklyrics-$Version-x86.fb2k-component"
+Compress-Archive -Path (Join-Path $ManualX86 "*") -DestinationPath $X86Zip
+Move-Item $X86Zip $X86Package -Force
 
-# foobar2000 1.5 / 1.6 are x86-only in this packaging flow.
-# Combined foobar2000 package: root is x86, x64 folder is x64 override.
-$PackageDir = Join-Path $DistRoot "foo_speaklyrics-package"
-Copy-Payload $PackageDir "x86" "Win32"
-Copy-Payload (Join-Path $PackageDir "x64") "x64" "x64"
-Compress-Archive -Path (Join-Path $PackageDir "*") -DestinationPath (Join-Path $DistRoot "foo_speaklyrics.zip")
-Move-Item (Join-Path $DistRoot "foo_speaklyrics.zip") (Join-Path $DistRoot "foo_speaklyrics.fb2k-component") -Force
+Remove-Item -LiteralPath $ManualX64,$ManualX86 -Recurse -Force
 
-Write-Host "Manual x64 folder: $ManualX64"
-Write-Host "Manual x86 folder: $ManualX86"
-Write-Host "x64 package: $(Join-Path $DistRoot 'foo_speaklyrics-x64.fb2k-component')"
-Write-Host "x86 package: $(Join-Path $DistRoot 'foo_speaklyrics-x86.fb2k-component')"
-Write-Host "combined package: $(Join-Path $DistRoot 'foo_speaklyrics.fb2k-component')"
+Write-Host "x64 package: $X64Package"
+Write-Host "x86 package: $X86Package"

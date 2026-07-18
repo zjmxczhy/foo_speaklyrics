@@ -1,5 +1,6 @@
 #pragma once
 #include "stdafx.h"
+#include "playback.h"
 
 enum class lyric_copy_mode {
     ask = 0,
@@ -13,3 +14,4 @@ lyric_copy_mode lyric_copy_mode_from_id(const char* id);
 const wchar_t* lyric_copy_mode_display_name(lyric_copy_mode mode);
 bool copy_current_lyrics(lyric_copy_mode mode);
 bool show_copy_lyrics_menu(HWND parent);
+std::vector<lyric_jump_item> filter_leading_lyric_credits(const std::vector<lyric_jump_item>& items);
