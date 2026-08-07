@@ -434,6 +434,12 @@ bool lrc_document::load(const std::wstring& path, pfc::string8& error) {
     clear();
     std::wstring text = lrc_read_text_file(path, nullptr, error);
     if (error.length() > 0) return false;
+    return load_text(text, path, error);
+}
+
+bool lrc_document::load_text(const std::wstring& text, const std::wstring& source, pfc::string8& error) {
+    clear();
+    error = "";
     int offset = 0;
     size_t start = 0;
     while (start <= text.size()) {
@@ -445,7 +451,7 @@ bool lrc_document::load(const std::wstring& path, pfc::string8& error) {
         if (start < text.size() && text[start - 1] == L'\r' && text[start] == L'\n') ++start;
     }
     std::sort(m_lines.begin(), m_lines.end(), [](const lrc_line& a, const lrc_line& b) { return a.time_ms < b.time_ms; });
-    m_path = path;
+    m_path = source;
     if (m_lines.empty()) {
         error = "没有解析到带时间标签的歌词行。";
         return false;

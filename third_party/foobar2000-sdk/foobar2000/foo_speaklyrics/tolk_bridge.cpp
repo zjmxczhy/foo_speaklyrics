@@ -99,6 +99,45 @@ std::wstring current_dll_dir() {
     return slash == std::wstring::npos ? L"" : wide.substr(0, slash);
 }
 
+class scoped_tolk_load_environment {
+public:
+    explicit scoped_tolk_load_environment(const std::wstring& directory) {
+        m_mutex = CreateMutexW(nullptr, FALSE, L"Local\\foobar2000.tolk-runtime-load");
+        if (!m_mutex) return;
+
+        DWORD waitResult = WaitForSingleObject(m_mutex, 10000);
+        if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_ABANDONED) return;
+        m_locked = true;
+
+        DWORD required = GetDllDirectoryW(0, nullptr);
+        if (required > 0) {
+            std::vector<wchar_t> buffer(static_cast<size_t>(required) + 1);
+            DWORD copied = GetDllDirectoryW(static_cast<DWORD>(buffer.size()), buffer.data());
+            if (copied > 0 && copied < buffer.size()) {
+                m_previous.assign(buffer.data(), copied);
+                m_had_previous = true;
+            }
+        }
+
+        m_ready = !directory.empty() && SetDllDirectoryW(directory.c_str()) != FALSE;
+    }
+
+    ~scoped_tolk_load_environment() {
+        if (m_ready) SetDllDirectoryW(m_had_previous ? m_previous.c_str() : nullptr);
+        if (m_locked) ReleaseMutex(m_mutex);
+        if (m_mutex) CloseHandle(m_mutex);
+    }
+
+    bool ready() const { return m_ready; }
+
+private:
+    HANDLE m_mutex = nullptr;
+    bool m_locked = false;
+    bool m_ready = false;
+    bool m_had_previous = false;
+    std::wstring m_previous;
+};
+
 void clear_tolk_exports() {
     pLoad = nullptr;
     pUnload = nullptr;
@@ -117,13 +156,17 @@ bool ensure_loaded() {
     std::wstring tolk_dir = g_component_dir;
     if (!tolk_dir.empty()) tolk_dir += L"\\tolk";
 
-    // Tolk resolves its screen reader support DLLs by file name.
-    if (!tolk_dir.empty()) SetDllDirectoryW(tolk_dir.c_str());
+    // Tolk resolves its screen reader support DLLs by file name. Serialize the
+    // process-wide search-path change with other foobar2000 Tolk components.
+    scoped_tolk_load_environment loadEnvironment(tolk_dir);
+    if (!loadEnvironment.ready()) {
+        speaklyrics_log_error(L"Tolk：无法设置独立运行库目录：%s。", tolk_dir.c_str());
+        return false;
+    }
 
     std::wstring path = tolk_dir;
     if (!path.empty()) path += L"\\Tolk.dll";
-    g_tolk = LoadLibraryW(path.empty() ? L"Tolk.dll" : path.c_str());
-    if (!g_tolk) g_tolk = LoadLibraryW(L"Tolk.dll");
+    g_tolk = LoadLibraryW(path.c_str());
     if (!g_tolk) {
         speaklyrics_log_error(L"Tolk：无法加载 Tolk.dll，路径：%s，错误码：%lu。", path.c_str(), GetLastError());
         return false;

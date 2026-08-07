@@ -61,6 +61,8 @@ struct lrc_match {
 
     bool temporary;
 
+    std::wstring embedded_text;
+
 };
 
 
@@ -742,7 +744,7 @@ bool contains_match_text(const std::wstring& haystack, const std::wstring& needl
 
 
 
-std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder, metadb_handle_ptr track, const std::optional<std::wstring>& trackPath) {
+std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder, metadb_handle_ptr track, const std::optional<std::wstring>& trackPath, bool allowFuzzyMatch) {
 
     if (folder.empty() || !fs::is_directory(folder)) return std::nullopt;
 
@@ -797,6 +799,8 @@ std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder, metad
     }
 
 
+
+    if (!allowFuzzyMatch) return std::nullopt;
 
     const std::wstring normalizedStem = trackPath ? normalize_match_text(base.stem().wstring()) : std::wstring();
 
@@ -874,6 +878,30 @@ std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder, metad
 
 }
 
+std::optional<std::wstring> find_embedded_lrc(metadb_handle_ptr track) {
+    if (track.is_empty()) return std::nullopt;
+
+    file_info_impl info;
+    if (!track->get_info(info)) return std::nullopt;
+
+    const t_size valueCount = info.meta_get_count_by_name("LYRICS");
+    for (t_size index = 0; index < valueCount; ++index) {
+        const char* value = info.meta_get("LYRICS", index);
+        if (!value || !*value) continue;
+
+        std::wstring text = utf8_to_wide(value);
+        lrc_document candidate;
+        pfc::string8 error;
+        if (candidate.load_text(text, L"<LYRICS>", error)) return text;
+
+        speaklyrics_log_warning(
+            L"标签歌词：LYRICS 的第 %llu 个值不包含可用时间戳，继续查找外部歌词。",
+            static_cast<unsigned long long>(index + 1));
+    }
+
+    return std::nullopt;
+}
+
 
 
 std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) {
@@ -882,7 +910,7 @@ std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) {
 
     if (!manual.empty() && !g_manual_lrc_track_key.empty() && g_manual_lrc_track_key == track_key(track) && fs::exists(manual)) {
 
-        return lrc_match{ manual, false };
+        return lrc_match{ manual, false, std::wstring() };
 
     }
 
@@ -890,11 +918,15 @@ std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) {
 
     auto trackPath = local_track_path(track);
 
+    std::optional<std::wstring> trackFolder;
+
     if (trackPath) {
 
-        fs::path trackFolder = fs::path(*trackPath).parent_path();
+        trackFolder = fs::path(*trackPath).parent_path().wstring();
 
-        if (auto local = find_lrc_in_folder(trackFolder.wstring(), track, trackPath)) return lrc_match{ *local, false };
+        if (auto local = find_lrc_in_folder(*trackFolder, track, trackPath, false)) {
+            return lrc_match{ *local, false, std::wstring() };
+        }
 
     }
 
@@ -902,13 +934,31 @@ std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) {
 
     std::wstring folder = cfg_path_wide(cfg_lrc_folder);
 
-    if (auto normal = find_lrc_in_folder(folder, track, trackPath)) return lrc_match{ *normal, false };
+    if (auto normal = find_lrc_in_folder(folder, track, trackPath, false)) {
+        return lrc_match{ *normal, false, std::wstring() };
+    }
+
+    if (auto embedded = find_embedded_lrc(track)) {
+        return lrc_match{ std::wstring(), false, std::move(*embedded) };
+    }
+
+    if (trackFolder) {
+        if (auto local = find_lrc_in_folder(*trackFolder, track, trackPath, true)) {
+            return lrc_match{ *local, false, std::wstring() };
+        }
+    }
+
+    if (auto normal = find_lrc_in_folder(folder, track, trackPath, true)) {
+        return lrc_match{ *normal, false, std::wstring() };
+    }
 
 
 
     std::wstring tempFolder = cfg_path_wide(cfg_temp_lrc_folder);
 
-    if (auto temp = find_lrc_in_folder(tempFolder, track, trackPath)) return lrc_match{ *temp, true };
+    if (auto temp = find_lrc_in_folder(tempFolder, track, trackPath, true)) {
+        return lrc_match{ *temp, true, std::wstring() };
+    }
 
 
 
@@ -1160,6 +1210,22 @@ void load_for_track(metadb_handle_ptr track) {
     }
 
     pfc::string8 error;
+
+    if (!found->embedded_text.empty()) {
+        if (g_doc.load_text(found->embedded_text, L"<LYRICS>", error)) {
+            speaklyrics_log_info(
+                L"歌词加载：已加载音频文件内嵌 LYRICS 标签，共 %llu 行。",
+                static_cast<unsigned long long>(g_doc.count()));
+            maybe_prefetch_same_title_candidates(track);
+        } else {
+            speaklyrics_log_error(
+                L"歌词加载：内嵌 LYRICS 标签解析失败：%s。",
+                pfc::stringcvt::string_wide_from_utf8(error.get_ptr()).get_ptr());
+            maybe_start_lrc_downloader(track);
+        }
+        refresh_lyrics_jump_window();
+        return;
+    }
 
     if (g_doc.load(found->path, error)) {
 

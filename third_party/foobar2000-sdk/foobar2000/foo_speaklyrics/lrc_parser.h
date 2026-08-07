@@ -20,6 +20,7 @@ bool lrc_write_text_file(const std::wstring& path, const std::wstring& text, con
 class lrc_document {
 public:
     bool load(const std::wstring& path, pfc::string8& error);
+    bool load_text(const std::wstring& text, const std::wstring& source, pfc::string8& error);
     void clear();
     bool empty() const { return m_lines.empty(); }
     int find_index_for_time(int ms) const;
