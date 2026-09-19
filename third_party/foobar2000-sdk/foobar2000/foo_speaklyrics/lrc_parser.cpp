@@ -293,7 +293,8 @@ static std::wstring strip_enhanced_lrc_tags(const std::wstring& text) {
     return out;
 }
 
-static void parse_line(const std::wstring& line, std::vector<lrc_line>& out, int& offset) {
+static void parse_line(const std::wstring& line, std::vector<lrc_line>& out, int& offset,
+    uint64_t& next_line_id) {
     std::vector<int> times;
     size_t pos = 0;
     size_t textStart = 0;
@@ -317,7 +318,9 @@ static void parse_line(const std::wstring& line, std::vector<lrc_line>& out, int
     if (times.empty()) return;
     std::wstring text = trim_copy(strip_enhanced_lrc_tags(line.substr(textStart)));
     if (text.empty()) return;
-    for (int t : times) out.push_back({ (std::max)(0, t + offset), text });
+    for (int t : times) {
+        out.push_back({ (std::max)(0, t + offset), text, next_line_id++ });
+    }
 }
 
 const lrc_encoding_info* lrc_get_encoding_options(size_t& count) {
@@ -441,16 +444,18 @@ bool lrc_document::load_text(const std::wstring& text, const std::wstring& sourc
     clear();
     error = "";
     int offset = 0;
+    uint64_t next_line_id = 1;
     size_t start = 0;
     while (start <= text.size()) {
         size_t end = text.find_first_of(L"\r\n", start);
         std::wstring line = end == std::wstring::npos ? text.substr(start) : text.substr(start, end - start);
-        parse_line(line, m_lines, offset);
+        parse_line(line, m_lines, offset, next_line_id);
         if (end == std::wstring::npos) break;
         start = end + 1;
         if (start < text.size() && text[start - 1] == L'\r' && text[start] == L'\n') ++start;
     }
-    std::sort(m_lines.begin(), m_lines.end(), [](const lrc_line& a, const lrc_line& b) { return a.time_ms < b.time_ms; });
+    std::stable_sort(m_lines.begin(), m_lines.end(),
+        [](const lrc_line& a, const lrc_line& b) { return a.time_ms < b.time_ms; });
     m_path = source;
     if (m_lines.empty()) {
         error = "没有解析到带时间标签的歌词行。";

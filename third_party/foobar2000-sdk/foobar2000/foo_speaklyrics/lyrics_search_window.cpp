@@ -1,8 +1,10 @@
 ﻿#include "stdafx.h"
 
 #include "lyrics_search_window.h"
+#include "background_task.h"
 #include "config.h"
 #include "playback.h"
+#include "process_runner.h"
 #include "resource.h"
 #include "speech_engine.h"
 #include "speaklyrics_log.h"
@@ -10,13 +12,9 @@
 
 #include <cwctype>
 #include <sstream>
-#include <thread>
 #include <windowsx.h>
 
 namespace {
-
-constexpr UINT WM_SEARCH_DONE = WM_APP + 0x451;
-constexpr UINT WM_DOWNLOAD_DONE = WM_APP + 0x452;
 
 HWND g_window = nullptr;
 HWND g_auto_button = nullptr;
@@ -29,9 +27,11 @@ HWND g_progress = nullptr;
 HWND g_list = nullptr;
 HWND g_close_button = nullptr;
 bool g_searching = false;
-std::wstring g_last_search_title;
-std::wstring g_last_search_artist;
-std::wstring g_last_current_artist;
+uint64_t g_window_generation = 0;
+uint64_t g_search_request_id = 0;
+uint64_t g_download_request_id = 0;
+speaklyrics_background_task_ptr g_search_task;
+speaklyrics_background_task_ptr g_download_task;
 
 struct search_result_item {
     std::wstring title;
@@ -39,16 +39,6 @@ struct search_result_item {
     std::wstring source_key;
     std::wstring source_name;
     bool placeholder = false;
-};
-
-struct search_done_payload {
-    std::vector<search_result_item> items;
-    bool auto_downloaded = false;
-};
-
-struct download_done_payload {
-    bool ok = false;
-    std::wstring error;
 };
 
 std::vector<search_result_item> g_items;
@@ -146,46 +136,6 @@ std::wstring component_dir() {
     return fs::path(path).parent_path().wstring();
 }
 
-bool run_process_capture_stdout(const std::wstring& command, const fs::path& workDir, std::string& stdoutText, DWORD& exitCode) {
-    stdoutText.clear();
-    exitCode = 3;
-    SECURITY_ATTRIBUTES sa = {};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    HANDLE readPipe = nullptr;
-    HANDLE writePipe = nullptr;
-    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) return false;
-    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput = writePipe;
-    si.hStdError = writePipe;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    PROCESS_INFORMATION pi = {};
-    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
-    mutableCommand.push_back(L'\0');
-    BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, workDir.c_str(), &si, &pi);
-    CloseHandle(writePipe);
-    if (!ok) {
-        CloseHandle(readPipe);
-        return false;
-    }
-    char buffer[4096];
-    DWORD read = 0;
-    while (ReadFile(readPipe, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
-        stdoutText.append(buffer, buffer + read);
-    }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    CloseHandle(readPipe);
-    return true;
-}
-
 fs::path downloader_path() {
     return fs::path(component_dir()) / L"downloader" / L"LrcDownloader.exe";
 }
@@ -266,6 +216,21 @@ void set_searching(bool searching) {
     }
 }
 
+void cancel_search_background_tasks() {
+    if (g_search_task) {
+        g_search_task->cancel();
+        g_search_task.reset();
+    }
+    if (g_download_task) {
+        g_download_task->cancel();
+        g_download_task.reset();
+    }
+    ++g_window_generation;
+    ++g_search_request_id;
+    ++g_download_request_id;
+    g_searching = false;
+}
+
 bool has_enabled_sources() {
     std::wstring sources = cfg_to_wide_local(cfg_lyric_sources);
     return !trim_text(sources).empty();
@@ -281,63 +246,116 @@ bool is_temporary_download(bool permanent) {
     return !permanent && trim_text(cfg_to_wide_local(cfg_lrc_folder)).empty();
 }
 
-bool download_item_to_folder(const search_result_item& item, const std::wstring& folder, bool temporary, std::wstring& error) {
+bool download_item_to_folder(const search_result_item& item, const std::wstring& folder,
+    bool temporary, const std::wstring& source, const std::wstring& manifestPath,
+    const fs::path& exe, foobar2000_io::abort_callback& aborter, std::wstring& error) {
     if (item.placeholder) return false;
     if (trim_text(folder).empty()) {
         error = L"\u6CA1\u6709\u8BBE\u7F6ELRC\u6B4C\u8BCD\u76EE\u5F55";
         speaklyrics_log_error(L"手动搜索下载：没有设置输出目录。");
         return false;
     }
+
+    aborter.check();
     std::error_code ec;
     fs::create_directories(folder, ec);
-    fs::path exe = downloader_path();
-    if (!fs::exists(exe, ec)) {
+    if (ec || !fs::is_directory(folder, ec)) {
+        error = L"\u65E0\u6CD5\u4F7F\u7528LRC\u6B4C\u8BCD\u76EE\u5F55";
+        speaklyrics_log_error(L"手动搜索下载：输出目录不可用：%s。", folder.c_str());
+        return false;
+    }
+    ec.clear();
+    if (!fs::exists(exe, ec) || ec) {
         error = L"\u627E\u4E0D\u5230\u6B4C\u8BCD\u4E0B\u8F7D\u5668";
         speaklyrics_log_error(L"手动搜索下载：找不到歌词下载器：%s。", exe.c_str());
         return false;
     }
-    std::wstring source = item.source_key.empty() ? cfg_to_wide_local(cfg_lyric_sources) : item.source_key;
+
     std::wstring cmd = command_line_quote(exe.wstring()) +
         L" --title " + command_line_quote(item.title) +
         L" --artist " + command_line_quote(item.artist) +
         L" --sources " + command_line_quote(source) +
         L" --out " + command_line_quote(folder) +
         L" --search-only";
-    if (temporary) {
-        std::wstring manifestPath = temp_lrc_manifest_path();
-        if (!manifestPath.empty()) cmd += L" --manifest " + command_line_quote(manifestPath);
+    if (temporary && !manifestPath.empty()) {
+        cmd += L" --manifest " + command_line_quote(manifestPath);
     }
-    std::string output;
-    DWORD code = 3;
-    bool ok = run_process_capture_stdout(cmd, exe.parent_path(), output, code);
-    if (!ok || code != 0) {
+
+    const speaklyrics_process_result process = run_process_capture_stdout(
+        cmd, exe.parent_path(), aborter, 60000, 1024 * 1024);
+    if (process.status != speaklyrics_process_status::completed || process.exit_code != 0) {
         error = L"\u6B4C\u8BCD\u4E0B\u8F7D\u5931\u8D25";
-        speaklyrics_log_error(L"手动搜索下载：下载失败，退出码：%lu，标题：%s，艺术家：%s。", code, item.title.c_str(), item.artist.c_str());
+        speaklyrics_log_error(
+            L"手动搜索下载：进程失败，状态=%s，退出码：%lu，错误码：%lu，标题：%s，艺术家：%s。",
+            speaklyrics_process_status_name(process.status), process.exit_code,
+            process.error_code, item.title.c_str(), item.artist.c_str());
         return false;
     }
-    speaklyrics_log_info(L"手动搜索下载：下载成功，标题：%s，艺术家：%s，目录：%s。", item.title.c_str(), item.artist.c_str(), folder.c_str());
+    speaklyrics_log_info(L"手动搜索下载：下载成功，标题：%s，艺术家：%s，目录：%s。",
+        item.title.c_str(), item.artist.c_str(), folder.c_str());
     return true;
 }
 
-bool should_auto_download(const search_result_item& item) {
+bool should_auto_download(const search_result_item& item, const std::wstring& searchTitle,
+    const std::wstring& searchArtist, const std::wstring& currentArtist) {
     if (item.placeholder) return false;
-    if (!same_match(item.title, g_last_search_title)) return false;
-    if (!trim_text(g_last_search_artist).empty()) return same_match(item.artist, g_last_search_artist);
-    if (!trim_text(g_last_current_artist).empty()) return same_match(item.artist, g_last_current_artist);
+    if (!same_match(item.title, searchTitle)) return false;
+    if (!trim_text(searchArtist).empty()) return same_match(item.artist, searchArtist);
+    if (!trim_text(currentArtist).empty()) return same_match(item.artist, currentArtist);
     return false;
 }
 
 void start_download(size_t index, bool permanent) {
     if (index >= g_items.size() || g_items[index].placeholder) return;
-    search_result_item item = g_items[index];
-    std::wstring folder = output_folder_for_download(permanent);
-    bool temporary = is_temporary_download(permanent);
-    std::thread([item, folder, temporary]() {
-        auto payload = new download_done_payload();
-        payload->ok = download_item_to_folder(item, folder, temporary, payload->error);
-        if (g_window && IsWindow(g_window)) PostMessageW(g_window, WM_DOWNLOAD_DONE, 0, reinterpret_cast<LPARAM>(payload));
-        else delete payload;
-    }).detach();
+    const search_result_item item = g_items[index];
+    const std::wstring folder = output_folder_for_download(permanent);
+    const bool temporary = is_temporary_download(permanent);
+    const std::wstring source = item.source_key.empty()
+        ? cfg_to_wide_local(cfg_lyric_sources) : item.source_key;
+    const std::wstring manifestPath = temporary ? temp_lrc_manifest_path() : L"";
+    const fs::path exe = downloader_path();
+    const HWND window = g_window;
+    const uint64_t windowGeneration = g_window_generation;
+    const uint64_t request = ++g_download_request_id;
+
+    if (g_download_task) {
+        g_download_task->cancel();
+        g_download_task.reset();
+    }
+    auto task = speaklyrics_start_background_task(L"manual lyric download");
+    if (!task) return;
+    g_download_task = task;
+    speaklyrics_run_background_task(task,
+        [task, item, folder, temporary, source, manifestPath, exe, window,
+            windowGeneration, request](speaklyrics_background_task& background) {
+        std::wstring error;
+        bool ok = false;
+        try {
+            ok = download_item_to_folder(item, folder, temporary, source, manifestPath,
+                exe, background.aborter(), error);
+        } catch (const foobar2000_io::exception_aborted&) {
+            return;
+        } catch (...) {
+            error = L"\u6B4C\u8BCD\u4E0B\u8F7D\u5931\u8D25";
+            speaklyrics_log_error(L"手动搜索下载：下载任务发生未知异常。");
+        }
+        background.post_to_main_thread([task, ok, error, window, windowGeneration, request]() {
+            if (g_window != window || !IsWindow(window) ||
+                g_window_generation != windowGeneration ||
+                g_download_request_id != request || g_download_task.get() != task.get()) {
+                return;
+            }
+            g_download_task.reset();
+            if (ok) {
+                reload_current_lyrics();
+            } else {
+                pfc::string8 msg = wide_to_pfc_utf8(
+                    error.empty() ? L"\u6B4C\u8BCD\u4E0B\u8F7D\u5931\u8D25" : error);
+                popup_message::g_show(msg.get_ptr(), "\xE6\x90\x9C\xE7\xB4\xA2lrc\xE6\xAD\x8C\xE8\xAF\x8D");
+                speech_queue_speak(error.empty() ? L"\u6B4C\u8BCD\u4E0B\u8F7D\u5931\u8D25" : error.c_str(), true);
+            }
+        });
+    });
 }
 
 void auto_fill_current_playing() {
@@ -363,9 +381,6 @@ void start_search() {
         return;
     }
     current_track_search_info current = get_current_track_search_info();
-    g_last_search_title = title;
-    g_last_search_artist = artist;
-    g_last_current_artist = current.artist;
     std::wstring fallbackArtist = artist.empty() ? current.artist : artist;
     std::wstring sources = cfg_to_wide_local(cfg_lyric_sources);
     fs::path exe = downloader_path();
@@ -383,27 +398,66 @@ void start_search() {
         L" --duration " + std::to_wstring(current.duration_seconds) +
         L" --sources " + command_line_quote(sources);
 
-    std::thread([command, exe]() {
-        std::string output;
-        DWORD code = 3;
-        run_process_capture_stdout(command, exe.parent_path(), output, code);
-        auto payload = new search_done_payload();
-        if (code == 0) payload->items = parse_search_output(output);
-        if (payload->items.empty()) {
+    const std::wstring outputFolder = output_folder_for_download(false);
+    const bool temporaryDownload = is_temporary_download(false);
+    const std::wstring manifestPath = temporaryDownload ? temp_lrc_manifest_path() : L"";
+    const HWND window = g_window;
+    const uint64_t windowGeneration = g_window_generation;
+    const uint64_t request = ++g_search_request_id;
+    auto task = speaklyrics_start_background_task(L"manual lyric search");
+    if (!task) {
+        set_searching(false);
+        speaklyrics_log_warning(L"Background task skipped during shutdown.");
+        return;
+    }
+    g_search_task = task;
+    speaklyrics_run_background_task(task,
+        [task, command, exe, title, artist, currentArtist = current.artist,
+            sources, outputFolder, temporaryDownload, manifestPath, window,
+            windowGeneration, request](speaklyrics_background_task& background) {
+        const speaklyrics_process_result process = run_process_capture_stdout(
+            command, exe.parent_path(), background.aborter(), 30000, 1024 * 1024);
+        std::vector<search_result_item> items;
+        bool autoDownloaded = false;
+        if (process.status == speaklyrics_process_status::completed && process.exit_code == 0) {
+            items = parse_search_output(process.output);
+        }
+        if (items.empty()) {
             search_result_item empty;
             empty.placeholder = true;
-            payload->items.push_back(empty);
-        } else if (should_auto_download(payload->items.front())) {
-            std::wstring error;
-            std::wstring outputFolder = output_folder_for_download(false);
-            bool temporary = is_temporary_download(false);
-            if (!trim_text(outputFolder).empty() && download_item_to_folder(payload->items.front(), outputFolder, temporary, error)) {
-                payload->auto_downloaded = true;
-            }
+            items.push_back(empty);
+        } else if (should_auto_download(items.front(), title, artist, currentArtist) &&
+            !trim_text(outputFolder).empty()) {
+            const std::wstring source = items.front().source_key.empty()
+                ? sources : items.front().source_key;
+            std::wstring downloadError;
+            autoDownloaded = download_item_to_folder(items.front(), outputFolder,
+                temporaryDownload, source, manifestPath, exe, background.aborter(), downloadError);
         }
-        if (g_window && IsWindow(g_window)) PostMessageW(g_window, WM_SEARCH_DONE, 0, reinterpret_cast<LPARAM>(payload));
-        else delete payload;
-    }).detach();
+
+        const speaklyrics_process_status status = process.status;
+        const DWORD processExitCode = process.exit_code;
+        const DWORD processErrorCode = process.error_code;
+        background.post_to_main_thread([task, window, windowGeneration, request,
+            status, processExitCode, processErrorCode, items = std::move(items),
+            autoDownloaded]() mutable {
+            if (g_window != window || !IsWindow(window) ||
+                g_window_generation != windowGeneration ||
+                g_search_request_id != request || g_search_task.get() != task.get()) {
+                return;
+            }
+            g_search_task.reset();
+            set_searching(false);
+            if (status != speaklyrics_process_status::completed || processExitCode != 0) {
+                speaklyrics_log_warning(
+                    L"手动搜索：进程未完成，状态=%s，退出码：%lu，错误码：%lu。",
+                    speaklyrics_process_status_name(status), processExitCode, processErrorCode);
+            }
+            refresh_result_list(items);
+            if (autoDownloaded) reload_current_lyrics();
+            if (g_list) SetFocus(g_list);
+        });
+    });
 }
 
 
@@ -457,6 +511,7 @@ LRESULT CALLBACK list_subclass_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp, UI
 
 void reset_dialog_handles(HWND wnd) {
     if (wnd == g_window) {
+        cancel_search_background_tasks();
         if (g_list && IsWindow(g_list)) RemoveWindowSubclass(g_list, list_subclass_proc, 1);
         g_window = g_auto_button = g_title_edit = g_artist_edit = g_search_button = g_title_label = g_artist_label = g_progress = g_list = g_close_button = nullptr;
         g_items.clear();
@@ -467,6 +522,7 @@ void reset_dialog_handles(HWND wnd) {
 INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_INITDIALOG:
+        ++g_window_generation;
         g_window = wnd;
         g_auto_button = GetDlgItem(wnd, IDC_SEARCH_AUTO_FILL);
         g_title_edit = GetDlgItem(wnd, IDC_SEARCH_TITLE);
@@ -528,30 +584,6 @@ INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             return TRUE;
         }
         break;
-    case WM_SEARCH_DONE: {
-        auto payload = reinterpret_cast<search_done_payload*>(lp);
-        set_searching(false);
-        if (payload) {
-            refresh_result_list(payload->items);
-            if (payload->auto_downloaded) reload_current_lyrics();
-            delete payload;
-        }
-        if (g_list) SetFocus(g_list);
-        return TRUE;
-    }
-    case WM_DOWNLOAD_DONE: {
-        auto payload = reinterpret_cast<download_done_payload*>(lp);
-        if (payload) {
-            if (payload->ok) reload_current_lyrics();
-            else {
-                pfc::string8 msg = wide_to_pfc_utf8(payload->error.empty() ? L"\u6B4C\u8BCD\u4E0B\u8F7D\u5931\u8D25" : payload->error);
-                popup_message::g_show(msg.get_ptr(), "\xE6\x90\x9C\xE7\xB4\xA2lrc\xE6\xAD\x8C\xE8\xAF\x8D");
-                speech_queue_speak(payload->error.empty() ? L"\u6B4C\u8BCD\u4E0B\u8F7D\u5931\u8D25" : payload->error.c_str(), true);
-            }
-            delete payload;
-        }
-        return TRUE;
-    }
     case WM_CLOSE:
         EndDialog(wnd, IDCANCEL);
         return TRUE;
@@ -570,5 +602,9 @@ void show_lyrics_search_window(HWND parent) {
         return;
     }
     DialogBoxParamW(core_api::get_my_instance(), MAKEINTRESOURCEW(IDD_SEARCH_LRC), parent, dialog_proc, 0);
+}
+
+void cancel_lyrics_search_background_tasks() {
+    cancel_search_background_tasks();
 }
 

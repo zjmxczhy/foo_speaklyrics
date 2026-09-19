@@ -877,7 +877,20 @@ static void queue_foobar_restart() {
     });
 }
 
-static bool save_dialog(HWND wnd) {
+struct settings_save_result {
+    bool restart_requested = false;
+    bool lyrics_reload_needed = false;
+};
+
+static settings_save_result save_dialog(HWND wnd) {
+
+    settings_save_result result;
+
+    const std::string oldLrcFolder = cfg_lrc_folder.get().c_str();
+    const std::string oldTempLrcFolder = cfg_temp_lrc_folder.get().c_str();
+    const std::string oldLrcEncoding = cfg_lrc_encoding.get().c_str();
+    const std::string oldLyricSources = cfg_lyric_sources.get().c_str();
+    const bool oldAutoSpeak = cfg_auto_speak.get();
 
     BOOL ok = FALSE;
 
@@ -899,7 +912,11 @@ static bool save_dialog(HWND wnd) {
 
     int deleteDelayMs = static_cast<int>(GetDlgItemInt(wnd, IDC_TEMP_LRC_DELETE_DELAY_MS, &deleteDelayOk, FALSE));
 
-    cfg_auto_speak = (IsDlgButtonChecked(wnd, IDC_AUTO_SPEAK) == BST_CHECKED);
+    const bool newAutoSpeak = IsDlgButtonChecked(wnd, IDC_AUTO_SPEAK) == BST_CHECKED;
+    cfg_auto_speak = newAutoSpeak;
+    if (oldAutoSpeak && !newAutoSpeak) {
+        speech_invalidate_pending(speech_invalidation_reason::auto_speak_disabled);
+    }
 
     cfg_announce_track_on_change = (IsDlgButtonChecked(wnd, IDC_ANNOUNCE_TRACK) == BST_CHECKED);
 
@@ -939,6 +956,8 @@ static bool save_dialog(HWND wnd) {
 
         set_manual_lrc_file_for_current_track(utf8.get_ptr());
 
+        result.lyrics_reload_needed = true;
+
     }
 
     set_cfg_from_wide(cfg_lrc_folder, get_dlg_text(wnd, IDC_LRC_FOLDER));
@@ -950,6 +969,13 @@ static bool save_dialog(HWND wnd) {
     save_lyric_speak_mode_combo(wnd);
 
     save_source_list(wnd);
+
+    if (oldLrcFolder != std::string(cfg_lrc_folder.get().c_str()) ||
+        oldTempLrcFolder != std::string(cfg_temp_lrc_folder.get().c_str()) ||
+        oldLrcEncoding != std::string(cfg_lrc_encoding.get().c_str()) ||
+        oldLyricSources != std::string(cfg_lyric_sources.get().c_str())) {
+        result.lyrics_reload_needed = true;
+    }
 
     save_copy_mode_controls(wnd);
 
@@ -965,19 +991,18 @@ static bool save_dialog(HWND wnd) {
 
     cfg_tts_rate = current_tts_rate(wnd);
 
-    bool restartRequested = false;
     if (!write_screen_reader_channel_config_files()) {
         pfc::string8 message = pfc::stringcvt::string_utf8_from_wide(
             L"\u8bfb\u5c4f\u901a\u9053\u914d\u7f6e\u65e0\u6cd5\u5199\u5165\u3002"
             L"\u8bf7\u68c0\u67e5\u7ec4\u4ef6\u76ee\u5f55\u6743\u9650\uff1b\u4e89\u6e21\u901a\u9053\u540d\u79f0\u8bf7\u4f7f\u7528 GBK \u53ef\u8868\u793a\u7684\u5b57\u7b26\u3002");
         popup_message::g_show(message.get_ptr(), "\xE6\x9C\x97\xE8\xAF\xBB\xE6\xAD\x8C\xE8\xAF\x8D");
     } else if (channelProfilesChanged) {
-        restartRequested = confirm_foobar_restart(wnd);
+        result.restart_requested = confirm_foobar_restart(wnd);
     }
 
-    if (!restartRequested) speech_preload();
+    if (!result.restart_requested) speech_preload();
 
-    return restartRequested;
+    return result;
 }
 
 
@@ -1127,11 +1152,16 @@ static INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDOK:
 
             {
-                bool restartRequested = save_dialog(wnd);
+                settings_save_result result = save_dialog(wnd);
 
                 EndDialog(wnd, IDOK);
 
-                if (restartRequested) queue_foobar_restart();
+                if (result.restart_requested) {
+                    queue_foobar_restart();
+                } else if (result.lyrics_reload_needed) {
+                    speaklyrics_log_info(L"设置保存：歌词相关设置已变化，重新加载当前歌曲歌词。");
+                    reload_current_lyrics();
+                }
             }
 
             return TRUE;
@@ -1139,12 +1169,17 @@ static INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_APPLY_SETTINGS:
 
             {
-                bool restartRequested = save_dialog(wnd);
+                settings_save_result result = save_dialog(wnd);
 
-                if (restartRequested) {
+                if (result.restart_requested) {
                     EndDialog(wnd, IDOK);
                     queue_foobar_restart();
                     return TRUE;
+                }
+
+                if (result.lyrics_reload_needed) {
+                    speaklyrics_log_info(L"设置应用：歌词相关设置已变化，重新加载当前歌曲歌词。");
+                    reload_current_lyrics();
                 }
             }
 

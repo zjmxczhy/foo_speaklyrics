@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
@@ -71,8 +72,10 @@ namespace LrcDownloader
                     : BuildFileName(record.ArtistName, record.TrackName, options.Artist, options.Title);
                 if (!fileName.EndsWith(".lrc", StringComparison.OrdinalIgnoreCase)) fileName += ".lrc";
 
-                var outputPath = Path.Combine(options.OutDir, SanitizeFileName(fileName));
-                File.WriteAllText(outputPath, NormalizeNewlines(StripEnhancedLrcTags(record.SyncedLyrics)), new UTF8Encoding(false));
+                var outputPath = Path.GetFullPath(
+                    Path.Combine(options.OutDir, SanitizeFileName(fileName)));
+                WriteAllTextAtomically(outputPath,
+                    NormalizeNewlines(StripEnhancedLrcTags(record.SyncedLyrics)));
                 AppendManifest(options.ManifestPath, outputPath);
 
                 Console.WriteLine(outputPath);
@@ -1042,6 +1045,8 @@ namespace LrcDownloader
             check(!LooksLikeMojibake("你好吗？今天很好。"), "normal Chinese punctuation is not mojibake");
             check(LooksLikeMojibake("姝岃瘝鏃堕棿"), "known GBK mojibake sequence is detected");
 
+            failed += RunAtomicWriteSelfTests(check);
+
             if (failed == 0)
             {
                 Console.WriteLine("SELF_TEST_OK");
@@ -1049,6 +1054,75 @@ namespace LrcDownloader
             }
             Console.Error.WriteLine("SELF_TEST_FAILED: " + failed.ToString(CultureInfo.InvariantCulture));
             return 3;
+        }
+
+        private static int RunAtomicWriteSelfTests(Action<bool, string> check)
+        {
+            var failed = 0;
+            var directory = Path.Combine(Path.GetTempPath(),
+                "foo_speaklyrics-lrcdownloader-selftest-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(directory);
+                var target = Path.Combine(directory, "atomic-save.lrc");
+
+                WriteAllTextAtomically(target, "[00:01.00]first");
+                var created = File.Exists(target) &&
+                    File.ReadAllText(target, Encoding.UTF8) == "[00:01.00]first";
+                check(created, "atomic lyric save creates the final file");
+                if (!created) failed++;
+
+                WriteAllTextAtomically(target, "[00:02.00]replacement");
+                var replaced = File.ReadAllText(target, Encoding.UTF8) ==
+                    "[00:02.00]replacement";
+                check(replaced, "atomic lyric save replaces an existing file");
+                if (!replaced) failed++;
+
+                var noSuccessTemp = Directory.GetFiles(directory,
+                    "atomic-save.lrc.*.tmp").Length == 0;
+                check(noSuccessTemp,
+                    "successful atomic lyric save leaves no temporary file");
+                if (!noSuccessTemp) failed++;
+
+                var blockedTarget = Path.Combine(directory, "blocked.lrc");
+                Directory.CreateDirectory(blockedTarget);
+                var commitFailed = false;
+                try
+                {
+                    WriteAllTextAtomically(blockedTarget, "[00:03.00]must not commit");
+                }
+                catch (IOException)
+                {
+                    commitFailed = true;
+                }
+                check(commitFailed, "atomic lyric save reports commit failure");
+                if (!commitFailed) failed++;
+
+                var noFailureTemp = Directory.GetFiles(directory,
+                    "blocked.lrc.*.tmp").Length == 0;
+                check(noFailureTemp,
+                    "failed atomic lyric save cleans its temporary file");
+                if (!noFailureTemp) failed++;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    "FAIL: atomic lyric save self-test threw: " + ex.Message);
+                failed++;
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(directory)) Directory.Delete(directory, true);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(
+                        "WARN: atomic lyric self-test cleanup failed: " + ex.Message);
+                }
+            }
+            return failed;
         }
 
         private static string HttpGet(string url)
@@ -1179,6 +1253,62 @@ namespace LrcDownloader
         {
             foreach (var c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
             return name.Trim();
+        }
+
+        [Flags]
+        private enum MoveFileFlags : uint
+        {
+            ReplaceExisting = 0x1,
+            WriteThrough = 0x8
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool MoveFileEx(
+            string existingFileName, string newFileName, MoveFileFlags flags);
+
+        private static void WriteAllTextAtomically(string outputPath, string text)
+        {
+            if (string.IsNullOrWhiteSpace(outputPath))
+                throw new ArgumentException("The output path is empty.", "outputPath");
+
+            var fullOutputPath = Path.GetFullPath(outputPath);
+            var directory = Path.GetDirectoryName(fullOutputPath);
+            if (string.IsNullOrWhiteSpace(directory))
+                throw new IOException("The output directory is unavailable.");
+            Directory.CreateDirectory(directory);
+
+            var temporaryPath = fullOutputPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (var stream = new FileStream(temporaryPath, FileMode.CreateNew,
+                    FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
+                using (var writer = new StreamWriter(stream, new UTF8Encoding(false), 4096, true))
+                {
+                    writer.Write(text ?? string.Empty);
+                    writer.Flush();
+                    stream.Flush(true);
+                }
+
+                if (!MoveFileEx(temporaryPath, fullOutputPath,
+                    MoveFileFlags.ReplaceExisting | MoveFileFlags.WriteThrough))
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    throw new IOException("Atomic lyric commit failed with Win32 error " +
+                        error.ToString(CultureInfo.InvariantCulture) + ".");
+                }
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("WARN: temporary lyric cleanup failed: " +
+                        temporaryPath + ": " + ex.Message);
+                }
+            }
         }
 
         private static void AppendManifest(string manifestPath, string outputPath)

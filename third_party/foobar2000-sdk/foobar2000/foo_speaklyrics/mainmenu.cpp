@@ -190,8 +190,6 @@ public:
 
             show_settings_dialog(parent);
 
-            reload_current_lyrics();
-
             break;
 
         case cmd_toggle_auto: {
@@ -231,6 +229,8 @@ public:
             if (browse_lrc_file(parent, path)) {
 
                 set_manual_lrc_file_for_current_track(path.get_ptr());
+
+                reload_current_lyrics();
 
             }
 

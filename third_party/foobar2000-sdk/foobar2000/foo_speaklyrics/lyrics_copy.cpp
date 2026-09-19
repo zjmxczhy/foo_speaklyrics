@@ -467,6 +467,20 @@ bool copy_text_with_message(const std::wstring& text) {
 }
 
 bool run_copy_mode(lyric_copy_mode mode) {
+    const ensure_current_lyrics_result prepared = ensure_current_lyrics_loaded_for_copy();
+    if (prepared == ensure_current_lyrics_result::no_playing_track) {
+        speech_queue_speak(L"\u5f53\u524d\u6ca1\u6709\u6b63\u5728\u64ad\u653e\u7684\u6b4c\u66f2", true);
+        return false;
+    }
+    if (prepared == ensure_current_lyrics_result::background_download_pending) {
+        speech_queue_speak(L"\u5f53\u524d\u6ca1\u6709\u5df2\u52a0\u8f7d\u7684LRC\u6b4c\u8bcd\uff0c\u6b63\u5728\u540e\u53f0\u83b7\u53d6\u6b4c\u8bcd", true);
+        return false;
+    }
+    if (prepared == ensure_current_lyrics_result::unavailable) {
+        speech_queue_speak(L"\u5f53\u524d\u6ca1\u6709\u5df2\u52a0\u8f7d\u7684LRC\u6b4c\u8bcd", true);
+        return false;
+    }
+
     std::vector<lyric_jump_item> items = current_lyrics();
     if (cfg_copy_filter_leading_credits.get()) items = filter_leading_credits_impl(items);
     if (items.empty()) {

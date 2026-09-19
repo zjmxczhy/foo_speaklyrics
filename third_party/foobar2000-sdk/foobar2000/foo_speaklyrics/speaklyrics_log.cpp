@@ -3,7 +3,7 @@
 
 namespace {
 
-constexpr ULONGLONG kMaxLogBytes = 2 * 1024 * 1024;
+constexpr ULONGLONG kMaxLogBytes = 8 * 1024 * 1024;
 SRWLOCK g_log_lock = SRWLOCK_INIT;
 
 std::wstring format_message(const wchar_t* format, va_list args) {
@@ -110,6 +110,45 @@ std::wstring speaklyrics_log_file_path() {
     if (!core_api::are_services_available()) return L"";
     pfc::string8 path = core_api::pathInProfile("foo_speaklyrics.log");
     return fb2k_path_to_native_wide(path.get_ptr());
+}
+
+std::wstring speaklyrics_log_text_excerpt(const wchar_t* text, size_t maximumCharacters) {
+    if (!text || maximumCharacters == 0) return L"";
+
+    std::wstring excerpt;
+    excerpt.reserve(maximumCharacters + 3);
+    bool previousWasSpace = false;
+    for (const wchar_t* cursor = text; *cursor && excerpt.size() < maximumCharacters; ++cursor) {
+        wchar_t ch = *cursor;
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+        if (iswspace(ch)) {
+            if (previousWasSpace) continue;
+            ch = L' ';
+            previousWasSpace = true;
+        } else {
+            previousWasSpace = false;
+        }
+        excerpt.push_back(ch);
+    }
+
+    while (!excerpt.empty() && excerpt.back() == L' ') excerpt.pop_back();
+    if (wcslen(text) > maximumCharacters) excerpt += L"...";
+    return excerpt;
+}
+
+uint64_t speaklyrics_log_text_hash(const wchar_t* text) {
+    constexpr uint64_t offsetBasis = 1469598103934665603ULL;
+    constexpr uint64_t prime = 1099511628211ULL;
+    uint64_t hash = offsetBasis;
+    if (!text) return hash;
+    for (const wchar_t* cursor = text; *cursor; ++cursor) {
+        uint32_t value = static_cast<uint32_t>(*cursor);
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            hash ^= static_cast<uint8_t>((value >> shift) & 0xff);
+            hash *= prime;
+        }
+    }
+    return hash;
 }
 
 void speaklyrics_log_info(const wchar_t* format, ...) {

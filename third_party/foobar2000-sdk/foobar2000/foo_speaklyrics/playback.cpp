@@ -2,6 +2,10 @@
 
 #include "config.h"
 
+#include "background_task.h"
+#include "process_runner.h"
+
+#include "lrc_download_retry.h"
 #include "lrc_parser.h"
 #include "playback.h"
 #include "lyrics_copy.h"
@@ -11,19 +15,28 @@
 #include "speaklyrics_log.h"
 #include "temp_lrc_manifest.h"
 
+#include <unordered_set>
+
 
 
 namespace {
 
 lrc_document g_doc;
 
-int g_last_spoken = -1;
+uint64_t g_last_scheduled_line_id = 0;
+uint64_t g_last_dispatched_line_id = 0;
+uint64_t g_last_dispatched_task_id = 0;
+int g_scheduler_scan_trigger_ms = -1;
+uint64_t g_lyric_position_epoch = 1;
 
 std::atomic_bool g_same_title_switch_in_progress{ false };
 int g_same_title_candidate_index = 0;
 std::wstring g_same_title_candidate_cache_path;
 std::wstring g_same_title_candidate_cache_key;
 std::wstring g_same_title_prefetch_requested_key;
+speaklyrics_background_task_ptr g_same_title_prefetch_task;
+speaklyrics_background_task_ptr g_lrc_downloader_task;
+speaklyrics_background_task_ptr g_same_title_switch_task;
 
 bool g_paused = false;
 
@@ -33,11 +46,86 @@ bool g_current_lrc_temporary = false;
 
 std::wstring g_manual_lrc_track_key;
 
-double g_last_missing_lrc_retry_time = -1000.0;
+ULONGLONG g_last_missing_lrc_scan_tick = 0;
 
-std::wstring g_downloader_requested_track_key;
+lrc_download_retry_state g_lrc_download_state;
 
 std::wstring g_current_track_key;
+
+std::wstring g_loaded_lrc_track_key;
+
+struct lyric_match_fingerprint {
+    bool info_available = false;
+    std::wstring track_key;
+    t_uint32 subsong_index = 0;
+    std::wstring title;
+    std::wstring artist;
+    std::wstring album;
+    int duration_seconds = 0;
+    std::vector<std::wstring> embedded_lyrics;
+};
+
+lyric_match_fingerprint g_lyric_match_fingerprint;
+bool g_ignored_metadata_update_logged = false;
+
+uint64_t g_track_session_id = 0;
+uint64_t g_document_generation = 0;
+double g_last_playback_callback_time = -1.0;
+bool g_pending_announcement_skip_logged = false;
+uint64_t g_last_skip_document_generation = 0;
+uint64_t g_last_skip_line_id = 0;
+int g_last_skip_reason = 0;
+
+struct lyric_submission_record {
+    uint64_t track_session = 0;
+    uint64_t document_generation = 0;
+    uint64_t playback_generation = 0;
+    uint64_t speech_task_id = 0;
+    int line_index = -1;
+    uint64_t line_id = 0;
+    uint64_t position_epoch = 0;
+    int lyric_time_ms = 0;
+    int trigger_time_ms = 0;
+    uint64_t text_hash = 0;
+    ULONGLONG submitted_at = 0;
+    ULONGLONG expires_at = 0;
+    std::vector<uint64_t> line_ids;
+};
+
+lyric_submission_record g_last_lyric_submission;
+std::vector<lyric_submission_record> g_pending_lyric_submissions;
+std::vector<lyric_submission_record> g_recent_lyric_submissions;
+std::unordered_set<uint64_t> g_scheduled_line_ids;
+std::unordered_set<uint64_t> g_dispatched_line_ids;
+std::unordered_set<uint64_t> g_skipped_line_ids;
+std::unordered_set<uint64_t> g_retry_line_ids;
+
+struct track_diagnostic_counters {
+    uint64_t planned = 0;
+    uint64_t accepted = 0;
+    uint64_t dispatched = 0;
+    uint64_t failed = 0;
+    uint64_t task_expired = 0;
+    uint64_t canceled = 0;
+    uint64_t rejected = 0;
+    uint64_t suspected_duplicates = 0;
+    uint64_t crossed_lines = 0;
+    uint64_t expired_lines = 0;
+    uint64_t delayed_callbacks = 0;
+    uint64_t announcement_blocks = 0;
+};
+
+track_diagnostic_counters g_track_diagnostics;
+bool g_track_summary_logged = false;
+
+struct loaded_lrc_snapshot {
+    bool valid = false;
+    std::wstring track_key;
+    uint64_t document_hash = 0;
+    std::vector<uint64_t> dispatched_line_ids;
+    uint64_t last_dispatched_line_id = 0;
+    uint64_t last_dispatched_task_id = 0;
+};
 
 std::wstring g_pending_track_announce_text;
 
@@ -52,6 +140,13 @@ std::vector<pending_temp_lrc_delete> g_pending_temp_lrc_deletes;
 
 void cancel_pending_temp_lrc_delete(const std::wstring& path);
 void schedule_current_temp_lrc_delete();
+void reset_last_spoken(const wchar_t* reason);
+void advance_lyric_position_epoch(const wchar_t* reason);
+void mark_document_loaded(const wchar_t* source);
+loaded_lrc_snapshot capture_loaded_lrc_snapshot();
+void restore_last_spoken_if_same_lyrics(const loaded_lrc_snapshot& snapshot, metadb_handle_ptr track,
+    const wchar_t* source);
+void process_speech_task_results();
 
 
 
@@ -165,48 +260,6 @@ std::wstring command_line_quote(const std::wstring& value) {
 
 }
 
-bool run_process_capture_stdout(const std::wstring& command, const fs::path& workDir, std::string& stdoutText, DWORD& exitCode) {
-    stdoutText.clear();
-    exitCode = 3;
-    SECURITY_ATTRIBUTES sa = {};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    HANDLE readPipe = nullptr;
-    HANDLE writePipe = nullptr;
-    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) return false;
-    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput = writePipe;
-    si.hStdError = writePipe;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    PROCESS_INFORMATION pi = {};
-    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
-    mutableCommand.push_back(L'\0');
-    BOOL ok = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, TRUE,
-        CREATE_NO_WINDOW, nullptr, workDir.c_str(), &si, &pi);
-    CloseHandle(writePipe);
-    if (!ok) {
-        CloseHandle(readPipe);
-        return false;
-    }
-
-    char buffer[4096];
-    DWORD read = 0;
-    while (ReadFile(readPipe, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
-        stdoutText.append(buffer, buffer + read);
-    }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    CloseHandle(readPipe);
-    return true;
-}
-
 void parse_candidate_downloader_output(const std::string& output, std::wstring& path, std::wstring& title, std::wstring& artist) {
     std::wstring text = utf8_to_wide(output.c_str());
     size_t start = 0;
@@ -235,6 +288,89 @@ std::wstring meta_value(const file_info_impl& info, const char* name) {
 
     return value && *value ? utf8_to_wide(value) : std::wstring();
 
+}
+
+lyric_match_fingerprint make_lyric_match_fingerprint(metadb_handle_ptr track) {
+    lyric_match_fingerprint fingerprint;
+    if (track.is_empty()) return fingerprint;
+
+    fingerprint.track_key = track_key(track);
+    fingerprint.subsong_index = track->get_subsong_index();
+
+    file_info_impl info;
+    // on_playback_edited() can arrive while the fresh metadb hint is still
+    // pending. Prefer the async snapshot so title, artist and LYRICS changes
+    // are compared against the newly edited values instead of stale cache.
+    fingerprint.info_available = track->get_info_async(info);
+    if (!fingerprint.info_available) {
+        fingerprint.info_available = track->get_info(info);
+    }
+    if (!fingerprint.info_available) return fingerprint;
+
+    fingerprint.title = meta_value(info, "title");
+    fingerprint.artist = meta_value(info, "artist");
+    fingerprint.album = meta_value(info, "album");
+
+    const double length = info.get_length();
+    if (length > 0) fingerprint.duration_seconds = static_cast<int>(length + 0.5);
+
+    const t_size lyricValueCount = info.meta_get_count_by_name("LYRICS");
+    fingerprint.embedded_lyrics.reserve(static_cast<size_t>(lyricValueCount));
+    for (t_size index = 0; index < lyricValueCount; ++index) {
+        const char* value = info.meta_get("LYRICS", index);
+        fingerprint.embedded_lyrics.push_back(utf8_to_wide(value ? value : ""));
+    }
+
+    return fingerprint;
+}
+
+enum lyric_match_field_mask : unsigned {
+    lyric_match_field_none = 0,
+    lyric_match_field_path = 1u << 0,
+    lyric_match_field_subsong = 1u << 1,
+    lyric_match_field_title = 1u << 2,
+    lyric_match_field_artist = 1u << 3,
+    lyric_match_field_album = 1u << 4,
+    lyric_match_field_duration = 1u << 5,
+    lyric_match_field_embedded_lyrics = 1u << 6,
+};
+
+unsigned lyric_match_fingerprint_difference(const lyric_match_fingerprint& previous,
+    const lyric_match_fingerprint& current) {
+    unsigned differences = lyric_match_field_none;
+    if (previous.track_key != current.track_key) differences |= lyric_match_field_path;
+    if (previous.subsong_index != current.subsong_index) differences |= lyric_match_field_subsong;
+    // A transiently unavailable metadata cache must not look like the user
+    // cleared every relevant field. Wait for the next edit notification when
+    // the current snapshot cannot be read.
+    if (current.info_available) {
+        if (!previous.info_available || previous.title != current.title) differences |= lyric_match_field_title;
+        if (!previous.info_available || previous.artist != current.artist) differences |= lyric_match_field_artist;
+        if (!previous.info_available || previous.album != current.album) differences |= lyric_match_field_album;
+        if (!previous.info_available || previous.duration_seconds != current.duration_seconds) differences |= lyric_match_field_duration;
+        if (!previous.info_available || previous.embedded_lyrics != current.embedded_lyrics) {
+            differences |= lyric_match_field_embedded_lyrics;
+        }
+    }
+    return differences;
+}
+
+std::wstring lyric_match_field_names(unsigned differences) {
+    std::wstring names;
+    const auto append = [&names](const wchar_t* name) {
+        if (!names.empty()) names += L"、";
+        names += name;
+    };
+
+    if (differences & lyric_match_field_path) append(L"路径");
+    if (differences & lyric_match_field_subsong) append(L"子曲目");
+    if (differences & lyric_match_field_title) append(L"标题");
+    if (differences & lyric_match_field_artist) append(L"艺术家");
+    if (differences & lyric_match_field_album) append(L"专辑");
+    if (differences & lyric_match_field_duration) append(L"时长");
+    if (differences & lyric_match_field_embedded_lyrics) append(L"内嵌LYRICS");
+
+    return names.empty() ? L"未知" : names;
 }
 
 std::wstring trim_text(std::wstring text) {
@@ -388,6 +524,10 @@ downloader_track_info get_downloader_track_info(metadb_handle_ptr track) {
 }
 
 void clear_same_title_candidate_cache() {
+    if (g_same_title_prefetch_task) {
+        g_same_title_prefetch_task->cancel();
+        g_same_title_prefetch_task.reset();
+    }
     if (!g_same_title_candidate_cache_path.empty()) {
         std::error_code error;
         fs::remove(g_same_title_candidate_cache_path, error);
@@ -435,25 +575,40 @@ void maybe_prefetch_same_title_candidates(metadb_handle_ptr track) {
         L" --sources " + command_line_quote(sources) +
         L" --search-only --title-only --list --candidate-cache " + command_line_quote(cachePath);
 
-    std::thread([command, exePath, key, cachePath]() {
-        std::string output;
-        DWORD exitCode = 3;
-        const bool started = run_process_capture_stdout(command, exePath.parent_path(), output, exitCode);
-        fb2k::inMainThread([key, cachePath, started, exitCode]() {
+    auto task = speaklyrics_start_background_task(L"同名歌词候选预取");
+    if (!task) {
+        speaklyrics_log_warning(L"Background task skipped during shutdown.");
+        return;
+    }
+    g_same_title_prefetch_task = task;
+    const uint64_t session = g_track_session_id;
+    speaklyrics_run_background_task(task,
+        [task, command, exePath, key, cachePath, session](speaklyrics_background_task& background) {
+        const speaklyrics_process_result result = run_process_capture_stdout(
+            command, exePath.parent_path(), background.aborter(), 30000, 1024 * 1024);
+        background.post_to_main_thread([task, key, cachePath, session, result]() {
+            if (g_same_title_prefetch_task.get() == task.get()) {
+                g_same_title_prefetch_task.reset();
+            }
             metadb_handle_ptr currentTrack;
             if (!static_api_ptr_t<playback_control>()->get_now_playing(currentTrack) ||
-                track_key(currentTrack) != key || g_current_track_key != key) {
+                track_key(currentTrack) != key || g_current_track_key != key ||
+                g_track_session_id != session) {
                 std::error_code error;
                 fs::remove(cachePath, error);
                 return;
             }
-            if (started && exitCode == 0 && fs::exists(cachePath)) {
+            if (result.status == speaklyrics_process_status::completed &&
+                result.exit_code == 0 && fs::exists(cachePath)) {
                 speaklyrics_log_info(L"同名歌词候选：已完成后台预取。");
             } else {
-                speaklyrics_log_warning(L"同名歌词候选：后台预取未完成。");
+                speaklyrics_log_warning(
+                    L"同名歌词候选：后台预取未完成，状态=%s，退出码=%lu，错误码=%lu。",
+                    speaklyrics_process_status_name(result.status), result.exit_code,
+                    result.error_code);
             }
         });
-    }).detach();
+    });
 }
 
 std::wstring fallback_track_path_text(metadb_handle_ptr track) {
@@ -529,7 +684,7 @@ bool queue_or_speak_track_announcement(metadb_handle_ptr track) {
 
     int delay = announce_track_delay_ms();
     if (delay <= 0) {
-        speech_queue_speak(text.c_str(), true);
+        speech_queue_track_announcement(text.c_str(), true);
     } else {
         g_pending_track_announce_text = text;
         g_pending_track_announce_due_tick = GetTickCount64() + static_cast<ULONGLONG>(delay);
@@ -547,7 +702,71 @@ void process_pending_track_announcement() {
     if (GetTickCount64() < g_pending_track_announce_due_tick) return;
     std::wstring text = g_pending_track_announce_text;
     cancel_pending_track_announcement();
-    speech_queue_speak(text.c_str(), true);
+    speech_queue_track_announcement(text.c_str(), true);
+}
+
+std::wstring lrc_downloader_error_detail(const std::string& output) {
+    const std::wstring text = utf8_to_wide(output.c_str());
+    std::wstring fallback;
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t end = text.find_first_of(L"\r\n", start);
+        std::wstring line = trim_text(text.substr(
+            start, end == std::wstring::npos ? std::wstring::npos : end - start));
+        if (!line.empty()) {
+            fallback = line;
+            if (line.rfind(L"ERROR:", 0) == 0) {
+                if (line.size() > 512) line.resize(512);
+                return line;
+            }
+        }
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+        if (start < text.size() && text[end] == L'\r' && text[start] == L'\n') ++start;
+    }
+    if (fallback.size() > 512) fallback.resize(512);
+    return fallback;
+}
+
+void mark_lrc_download_transient_failure(const std::wstring& key,
+    const std::wstring& reason, speaklyrics_process_status processStatus,
+    DWORD exitCode, DWORD errorCode) {
+    const uint64_t delay = g_lrc_download_state.mark_transient_failure(
+        key, GetTickCount64(), reason, static_cast<int>(processStatus),
+        exitCode, errorCode);
+    speaklyrics_log_warning(
+        L"自动下载：临时失败，原因=%s，状态=%s，退出码=%lu，错误码=%lu，下次重试=%llu秒后。",
+        reason.c_str(), speaklyrics_process_status_name(processStatus),
+        exitCode, errorCode, static_cast<unsigned long long>(delay / 1000));
+}
+
+void mark_lrc_download_preflight_failure(const std::wstring& key,
+    const std::wstring& reason) {
+    const uint64_t delay = g_lrc_download_state.mark_transient_failure(
+        key, GetTickCount64(), reason);
+    speaklyrics_log_warning(
+        L"自动下载：临时失败，原因=%s，下次重试=%llu秒后。",
+        reason.c_str(), static_cast<unsigned long long>(delay / 1000));
+}
+
+void mark_lrc_download_configuration_unavailable(const std::wstring& key,
+    const std::wstring& reason, uint64_t retryDelayMs =
+        lrc_download_retry_policy::no_retry_tick, DWORD exitCode = 0) {
+    g_lrc_download_state.mark_configuration_unavailable(
+        key, GetTickCount64(), reason, retryDelayMs, exitCode);
+    if (retryDelayMs == lrc_download_retry_policy::no_retry_tick) {
+        speaklyrics_log_warning(
+            L"自动下载：配置不可用，原因=%s；等待歌曲信息或歌词设置变化后重试。",
+            reason.c_str());
+    } else {
+        speaklyrics_log_warning(
+            L"自动下载：配置不可用，原因=%s；%llu秒后重新检查。",
+            reason.c_str(), static_cast<unsigned long long>(retryDelayMs / 1000));
+    }
+}
+
+bool lrc_download_in_progress_for(const std::wstring& key) {
+    return g_lrc_downloader_task && g_lrc_download_state.in_progress_for(key);
 }
 
 
@@ -560,13 +779,19 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
     std::wstring key = track_key(track);
 
-    if (key.empty() || g_downloader_requested_track_key == key) return;
+    if (key.empty()) return;
+
+    const ULONGLONG now = GetTickCount64();
+    if (!g_lrc_download_state.can_attempt(key, now)) return;
 
 
 
     std::wstring sources = cfg_path_wide(cfg_lyric_sources);
 
-    if (sources.empty()) return;
+    if (sources.empty()) {
+        mark_lrc_download_configuration_unavailable(key, L"没有启用歌词下载来源");
+        return;
+    }
 
 
 
@@ -574,7 +799,10 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
     bool temporaryDownload = trim_text(permanentFolder).empty();
     std::wstring outputFolder = temporaryDownload ? cfg_path_wide(cfg_temp_lrc_folder) : permanentFolder;
 
-    if (outputFolder.empty()) return;
+    if (outputFolder.empty()) {
+        mark_lrc_download_configuration_unavailable(key, L"没有设置可用的歌词输出目录");
+        return;
+    }
 
 
 
@@ -585,9 +813,8 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
     if (ec || !fs::is_directory(outputFolder, ec)) {
 
         FB2K_console_formatter() << "foo_speaklyrics: lrc download output folder is not available: " << pfc::stringcvt::string_utf8_from_wide(outputFolder.c_str()).get_ptr();
-        speaklyrics_log_error(L"自动下载：输出目录不可用：%s。", outputFolder.c_str());
-
-        g_downloader_requested_track_key = key;
+        mark_lrc_download_preflight_failure(
+            key, L"歌词输出目录暂时不可用：" + outputFolder);
 
         return;
 
@@ -600,9 +827,9 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
     if (!fs::exists(exePath, ec)) {
 
         FB2K_console_formatter() << "foo_speaklyrics: downloader not found: " << pfc::stringcvt::string_utf8_from_wide(exePath.c_str()).get_ptr();
-        speaklyrics_log_error(L"自动下载：找不到歌词下载器：%s。", exePath.c_str());
-
-        g_downloader_requested_track_key = key;
+        mark_lrc_download_configuration_unavailable(
+            key, L"找不到歌词下载器：" + exePath.wstring(),
+            lrc_download_retry_policy::missing_downloader_delay_ms);
 
         return;
 
@@ -615,9 +842,7 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
     if (info.title.empty()) {
 
         FB2K_console_formatter() << "foo_speaklyrics: downloader skipped because track title is empty";
-        speaklyrics_log_warning(L"自动下载：跳过下载，当前歌曲标题为空。");
-
-        g_downloader_requested_track_key = key;
+        mark_lrc_download_configuration_unavailable(key, L"当前歌曲标题为空");
 
         return;
 
@@ -651,32 +876,79 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
 
 
-    g_downloader_requested_track_key = key;
+    auto task = speaklyrics_start_background_task(L"automatic lyric download");
+    if (!task) {
+        speaklyrics_log_warning(L"Background task skipped during shutdown.");
+        mark_lrc_download_preflight_failure(key, L"无法启动歌词下载后台任务");
+        return;
+    }
+    const uint32_t attempt = g_lrc_download_state.begin_attempt(key);
+    g_lrc_downloader_task = task;
     FB2K_console_formatter() << "foo_speaklyrics: started lrc downloader for " << pfc::stringcvt::string_utf8_from_wide(info.title.c_str()).get_ptr();
-    speaklyrics_log_info(L"自动下载：已启动下载器，标题：%s，艺术家：%s，来源：%s。", info.title.c_str(), info.artist.c_str(), sources.c_str());
-
-    std::thread([command, exePath, key, temporaryDownload]() {
-        std::string output;
-        DWORD exitCode = 3;
-        const bool started = run_process_capture_stdout(command, exePath.parent_path(), output, exitCode);
+    speaklyrics_log_info(
+        L"自动下载：第%u次尝试开始，标题：%s，艺术家：%s，来源：%s。",
+        attempt, info.title.c_str(), info.artist.c_str(), sources.c_str());
+    const uint64_t session = g_track_session_id;
+    const bool backgroundStarted = speaklyrics_run_background_task(task,
+        [task, command, exePath, key, temporaryDownload, session](speaklyrics_background_task& background) {
+        const speaklyrics_process_result process = run_process_capture_stdout(
+            command, exePath.parent_path(), background.aborter(), 60000, 1024 * 1024);
         std::wstring downloadedPath;
         std::wstring selectedTitle;
         std::wstring selectedArtist;
-        if (started && exitCode == 0) {
-            parse_candidate_downloader_output(output, downloadedPath, selectedTitle, selectedArtist);
+        if (process.status == speaklyrics_process_status::completed && process.exit_code == 0) {
+            parse_candidate_downloader_output(process.output, downloadedPath, selectedTitle, selectedArtist);
         }
 
-        fb2k::inMainThread([key, temporaryDownload, started, exitCode, downloadedPath, selectedTitle, selectedArtist]() {
+        const speaklyrics_process_status status = process.status;
+        const DWORD processExitCode = process.exit_code;
+        const DWORD processErrorCode = process.error_code;
+        const std::wstring processDetail = lrc_downloader_error_detail(process.output);
+        background.post_to_main_thread([task, key, temporaryDownload, session, status,
+            processExitCode, processErrorCode, processDetail, downloadedPath,
+            selectedTitle, selectedArtist]() {
+            if (g_lrc_downloader_task.get() == task.get()) {
+                g_lrc_downloader_task.reset();
+            }
             metadb_handle_ptr currentTrack;
             if (!static_api_ptr_t<playback_control>()->get_now_playing(currentTrack) ||
-                track_key(currentTrack) != key) return;
+                track_key(currentTrack) != key || g_track_session_id != session) return;
+            if (!g_lrc_download_state.in_progress_for(key)) return;
 
-            if (!started) {
-                speaklyrics_log_error(L"自动下载：无法启动下载器。");
+            if (status != speaklyrics_process_status::completed) {
+                std::wstring reason = L"下载器进程未正常完成";
+                if (!processDetail.empty()) reason += L"：" + processDetail;
+                mark_lrc_download_transient_failure(
+                    key, reason, status, processExitCode, processErrorCode);
                 return;
             }
-            if (exitCode != 0 || downloadedPath.empty() || !fs::exists(downloadedPath)) {
-                speaklyrics_log_warning(L"自动下载：未找到可用 LRC。");
+            if (processExitCode == 1) {
+                const uint64_t cooldown = g_lrc_download_state.mark_not_found(
+                    key, GetTickCount64(), L"没有匹配的同步歌词", processExitCode);
+                speaklyrics_log_warning(
+                    L"自动下载：没有匹配结果，进入%llu秒冷却；本地歌词扫描仍会继续。",
+                    static_cast<unsigned long long>(cooldown / 1000));
+                return;
+            }
+            if (processExitCode == 2) {
+                std::wstring reason = L"下载器参数错误";
+                if (!processDetail.empty()) reason += L"：" + processDetail;
+                mark_lrc_download_configuration_unavailable(
+                    key, reason, lrc_download_retry_policy::no_retry_tick,
+                    processExitCode);
+                return;
+            }
+            if (processExitCode != 0) {
+                std::wstring reason = L"下载器执行错误或歌词文件提交失败";
+                if (!processDetail.empty()) reason += L"：" + processDetail;
+                mark_lrc_download_transient_failure(
+                    key, reason, status, processExitCode, processErrorCode);
+                return;
+            }
+            if (downloadedPath.empty() || !fs::exists(downloadedPath)) {
+                mark_lrc_download_transient_failure(
+                    key, L"下载器没有返回可验证的最终 LRC 文件",
+                    status, processExitCode, processErrorCode);
                 return;
             }
 
@@ -685,16 +957,35 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
             if (!downloadedDocument.load(downloadedPath, loadError)) {
                 speaklyrics_log_error(L"歌词加载：下载的 LRC 解析失败：%s，文件：%s。",
                     pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr(), downloadedPath.c_str());
+                std::wstring reason = L"下载的 LRC 解析失败：";
+                reason += pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr();
+                mark_lrc_download_transient_failure(
+                    key, reason, status, processExitCode, processErrorCode);
                 return;
             }
 
+            const uint32_t successfulAttempt = g_lrc_download_state.attempt_count;
+            speech_invalidate_pending(speech_invalidation_reason::lyrics_reload);
+            process_speech_task_results();
+            const loaded_lrc_snapshot previous = capture_loaded_lrc_snapshot();
             schedule_current_temp_lrc_delete();
+            reset_last_spoken(L"自动下载完成后直接加载歌词");
             g_doc = std::move(downloadedDocument);
             g_current_lrc = downloadedPath;
             g_current_lrc_temporary = temporaryDownload;
-            g_last_spoken = -1;
+            g_loaded_lrc_track_key = track_key(currentTrack);
+            mark_document_loaded(L"自动下载结果");
+            restore_last_spoken_if_same_lyrics(previous, currentTrack, L"自动下载结果");
             if (g_current_lrc_temporary) cancel_pending_temp_lrc_delete(g_current_lrc);
             refresh_lyrics_jump_window();
+
+            g_lrc_download_state.mark_succeeded(key);
+            speaklyrics_log_info(L"自动下载：原子写入及歌词加载已验证，最终文件：%s。",
+                downloadedPath.c_str());
+            if (successfulAttempt > 1) {
+                speaklyrics_log_info(L"自动下载：网络或下载环境恢复后，第%u次尝试成功。",
+                    successfulAttempt);
+            }
 
             FB2K_console_formatter() << "foo_speaklyrics: loaded downloaded lrc "
                 << pfc::stringcvt::string_utf8_from_wide(downloadedPath.c_str()).get_ptr();
@@ -702,7 +993,15 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
                 downloadedPath.c_str(), selectedTitle.c_str(), selectedArtist.c_str());
             maybe_prefetch_same_title_candidates(currentTrack);
         });
-    }).detach();
+    });
+    if (!backgroundStarted) {
+        if (g_lrc_downloader_task.get() == task.get()) {
+            g_lrc_downloader_task.reset();
+        }
+        mark_lrc_download_transient_failure(
+            key, L"歌词下载后台任务调度失败",
+            speaklyrics_process_status::failed_to_start, 3, ERROR_SUCCESS);
+    }
 
 }
 
@@ -878,6 +1177,71 @@ std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder, metad
 
 }
 
+struct embedded_lyric_diagnostics {
+    size_t physical_lines = 0;
+    size_t nonempty_lines = 0;
+    size_t parsed_lines = 0;
+    size_t duplicate_timestamps = 0;
+    size_t dense_intervals = 0;
+    size_t bom_lines = 0;
+    size_t whitespace_before_timestamp = 0;
+    size_t angle_timestamp_lines = 0;
+    bool literal_line_break_marker = false;
+    int minimum_positive_interval_ms = -1;
+};
+
+embedded_lyric_diagnostics analyze_embedded_lyrics(const std::wstring& text, const lrc_document& document) {
+    embedded_lyric_diagnostics diagnostics;
+    diagnostics.parsed_lines = document.count();
+    diagnostics.literal_line_break_marker = text.find(L"\\n") != std::wstring::npos ||
+        text.find(L"<br") != std::wstring::npos || text.find(L"<BR") != std::wstring::npos;
+
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t end = text.find_first_of(L"\r\n", start);
+        std::wstring line = end == std::wstring::npos ? text.substr(start) : text.substr(start, end - start);
+        ++diagnostics.physical_lines;
+
+        size_t first = 0;
+        while (first < line.size() && iswspace(line[first])) ++first;
+        if (first < line.size()) {
+            ++diagnostics.nonempty_lines;
+            if (line[first] == 0xfeff) {
+                ++diagnostics.bom_lines;
+                ++first;
+                while (first < line.size() && iswspace(line[first])) ++first;
+            }
+            if (first > 0 && first < line.size() && line[first] == L'[') {
+                ++diagnostics.whitespace_before_timestamp;
+            }
+            if (first < line.size() && line[first] == L'<') ++diagnostics.angle_timestamp_lines;
+        }
+
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+        if (start < text.size() && text[start - 1] == L'\r' && text[start] == L'\n') ++start;
+    }
+
+    int previousTime = -1;
+    for (size_t index = 0; index < document.count(); ++index) {
+        const lrc_line* line = document.get(index);
+        if (!line) continue;
+        if (previousTime >= 0) {
+            const int interval = line->time_ms - previousTime;
+            if (interval == 0) {
+                ++diagnostics.duplicate_timestamps;
+            } else if (interval > 0) {
+                if (interval < 1000) ++diagnostics.dense_intervals;
+                if (diagnostics.minimum_positive_interval_ms < 0 || interval < diagnostics.minimum_positive_interval_ms) {
+                    diagnostics.minimum_positive_interval_ms = interval;
+                }
+            }
+        }
+        previousTime = line->time_ms;
+    }
+    return diagnostics;
+}
+
 std::optional<std::wstring> find_embedded_lrc(metadb_handle_ptr track) {
     if (track.is_empty()) return std::nullopt;
 
@@ -885,6 +1249,19 @@ std::optional<std::wstring> find_embedded_lrc(metadb_handle_ptr track) {
     if (!track->get_info(info)) return std::nullopt;
 
     const t_size valueCount = info.meta_get_count_by_name("LYRICS");
+    if (valueCount == 0) return std::nullopt;
+
+    std::optional<std::wstring> selectedText;
+    size_t selectedIndex = 0;
+    size_t selectedLineCount = 0;
+    size_t parseableValueCount = 0;
+    size_t largestValueIndex = 0;
+    size_t largestLineCount = 0;
+
+    speaklyrics_log_info(L"标签歌词诊断：歌曲会话=%llu，检测到 LYRICS 值数量=%llu。",
+        static_cast<unsigned long long>(g_track_session_id),
+        static_cast<unsigned long long>(valueCount));
+
     for (t_size index = 0; index < valueCount; ++index) {
         const char* value = info.meta_get("LYRICS", index);
         if (!value || !*value) continue;
@@ -892,14 +1269,78 @@ std::optional<std::wstring> find_embedded_lrc(metadb_handle_ptr track) {
         std::wstring text = utf8_to_wide(value);
         lrc_document candidate;
         pfc::string8 error;
-        if (candidate.load_text(text, L"<LYRICS>", error)) return text;
+        const bool parsed = candidate.load_text(text, L"<LYRICS>", error);
+        const embedded_lyric_diagnostics diagnostics = analyze_embedded_lyrics(text, candidate);
+        speaklyrics_log_info(
+            L"标签歌词诊断：值=%llu/%llu，字符=%llu，物理行=%llu，非空行=%llu，有效时间行=%llu，重复时间戳=%llu，小于1秒间隔=%llu，最短正间隔=%d毫秒，BOM行=%llu，时间戳前空白行=%llu，尖括号开头行=%llu，字面换行标记=%s。",
+            static_cast<unsigned long long>(index + 1), static_cast<unsigned long long>(valueCount),
+            static_cast<unsigned long long>(text.size()),
+            static_cast<unsigned long long>(diagnostics.physical_lines),
+            static_cast<unsigned long long>(diagnostics.nonempty_lines),
+            static_cast<unsigned long long>(diagnostics.parsed_lines),
+            static_cast<unsigned long long>(diagnostics.duplicate_timestamps),
+            static_cast<unsigned long long>(diagnostics.dense_intervals),
+            diagnostics.minimum_positive_interval_ms,
+            static_cast<unsigned long long>(diagnostics.bom_lines),
+            static_cast<unsigned long long>(diagnostics.whitespace_before_timestamp),
+            static_cast<unsigned long long>(diagnostics.angle_timestamp_lines),
+            diagnostics.literal_line_break_marker ? L"是" : L"否");
 
-        speaklyrics_log_warning(
-            L"标签歌词：LYRICS 的第 %llu 个值不包含可用时间戳，继续查找外部歌词。",
-            static_cast<unsigned long long>(index + 1));
+        if (diagnostics.duplicate_timestamps > 0) {
+            speaklyrics_log_warning(L"标签歌词诊断：值=%llu 包含 %llu 个重复时间戳，当前朗读逻辑可能只选择同时间戳的最后一行。",
+                static_cast<unsigned long long>(index + 1),
+                static_cast<unsigned long long>(diagnostics.duplicate_timestamps));
+        }
+        if (diagnostics.dense_intervals > 0) {
+            speaklyrics_log_warning(L"标签歌词诊断：值=%llu 包含 %llu 个小于1秒的歌词间隔，每秒播放回调可能跨过部分歌词。",
+                static_cast<unsigned long long>(index + 1),
+                static_cast<unsigned long long>(diagnostics.dense_intervals));
+        }
+        if (diagnostics.bom_lines > 0 || diagnostics.whitespace_before_timestamp > 0 ||
+            diagnostics.angle_timestamp_lines > 0 || diagnostics.literal_line_break_marker) {
+            speaklyrics_log_warning(
+                L"标签歌词诊断：值=%llu 检测到可能影响解析的文本格式，请结合 BOM、行首空白、尖括号和字面换行统计排查漏读。",
+                static_cast<unsigned long long>(index + 1));
+        }
+
+        if (parsed) {
+            ++parseableValueCount;
+            if (!selectedText) {
+                selectedText = text;
+                selectedIndex = static_cast<size_t>(index);
+                selectedLineCount = candidate.count();
+            }
+            if (candidate.count() > largestLineCount) {
+                largestLineCount = candidate.count();
+                largestValueIndex = static_cast<size_t>(index);
+            }
+        } else {
+            speaklyrics_log_warning(
+                L"标签歌词：LYRICS 的第 %llu 个值不包含可用时间戳，解析信息=%s。",
+                static_cast<unsigned long long>(index + 1),
+                pfc::stringcvt::string_wide_from_utf8(error.get_ptr()).get_ptr());
+        }
     }
 
-    return std::nullopt;
+    if (!selectedText) return std::nullopt;
+
+    speaklyrics_log_info(L"标签歌词诊断：当前选择第 %llu 个 LYRICS 值，有效歌词=%llu行，可解析值总数=%llu。",
+        static_cast<unsigned long long>(selectedIndex + 1),
+        static_cast<unsigned long long>(selectedLineCount),
+        static_cast<unsigned long long>(parseableValueCount));
+    if (parseableValueCount > 1) {
+        speaklyrics_log_warning(
+            L"标签歌词诊断：存在 %llu 个可解析的 LYRICS 值，当前只使用第一个可解析值；如果标签按多值分段保存，可能造成歌词缺失。",
+            static_cast<unsigned long long>(parseableValueCount));
+    }
+    if (largestLineCount > selectedLineCount) {
+        speaklyrics_log_warning(
+            L"标签歌词诊断：第 %llu 个值包含 %llu 行，比当前选择的第 %llu 个值多，当前选择可能不是完整歌词。",
+            static_cast<unsigned long long>(largestValueIndex + 1),
+            static_cast<unsigned long long>(largestLineCount),
+            static_cast<unsigned long long>(selectedIndex + 1));
+    }
+    return selectedText;
 }
 
 
@@ -1116,21 +1557,370 @@ void delete_current_temp_lrc() {
 
 
 
-void clear_loaded_lrc() {
+void log_track_diagnostic_summary(const wchar_t* reason) {
+    if (g_track_session_id == 0 || g_track_summary_logged) return;
+    speaklyrics_log_info(
+        L"歌词诊断汇总：歌曲会话=%llu，结束原因=%s，计划=%llu，入队=%llu，已提交接口=%llu，失败=%llu，任务过期=%llu，取消=%llu，入队拒绝=%llu，疑似重复=%llu，时间轴跨过=%llu，超过有效时间=%llu，延迟回调=%llu，切歌播报阻塞=%llu。",
+        static_cast<unsigned long long>(g_track_session_id), reason ? reason : L"未知",
+        static_cast<unsigned long long>(g_track_diagnostics.planned),
+        static_cast<unsigned long long>(g_track_diagnostics.accepted),
+        static_cast<unsigned long long>(g_track_diagnostics.dispatched),
+        static_cast<unsigned long long>(g_track_diagnostics.failed),
+        static_cast<unsigned long long>(g_track_diagnostics.task_expired),
+        static_cast<unsigned long long>(g_track_diagnostics.canceled),
+        static_cast<unsigned long long>(g_track_diagnostics.rejected),
+        static_cast<unsigned long long>(g_track_diagnostics.suspected_duplicates),
+        static_cast<unsigned long long>(g_track_diagnostics.crossed_lines),
+        static_cast<unsigned long long>(g_track_diagnostics.expired_lines),
+        static_cast<unsigned long long>(g_track_diagnostics.delayed_callbacks),
+        static_cast<unsigned long long>(g_track_diagnostics.announcement_blocks));
+    g_track_summary_logged = true;
+}
 
+void reset_track_diagnostic_state() {
+    g_track_diagnostics = track_diagnostic_counters{};
+    g_last_playback_callback_time = -1.0;
+    g_pending_announcement_skip_logged = false;
+    g_last_skip_document_generation = 0;
+    g_last_skip_line_id = 0;
+    g_last_skip_reason = 0;
+    g_track_summary_logged = false;
+}
+
+uint64_t fnv1a_mix_u64(uint64_t hash, uint64_t value) {
+    constexpr uint64_t prime = 1099511628211ULL;
+    for (int i = 0; i < 8; ++i) {
+        hash ^= (value >> (i * 8)) & 0xff;
+        hash *= prime;
+    }
+    return hash;
+}
+
+uint64_t current_lyric_document_hash() {
+    uint64_t hash = 1469598103934665603ULL;
+    hash = fnv1a_mix_u64(hash, static_cast<uint64_t>(g_doc.count()));
+    for (size_t index = 0; index < g_doc.count(); ++index) {
+        const lrc_line* line = g_doc.get(index);
+        if (!line) continue;
+        hash = fnv1a_mix_u64(hash, static_cast<uint64_t>(line->time_ms));
+        hash = fnv1a_mix_u64(hash, speaklyrics_log_text_hash(line->text.c_str()));
+        hash = fnv1a_mix_u64(hash, static_cast<uint64_t>(line->text.size()));
+    }
+    return hash;
+}
+
+loaded_lrc_snapshot capture_loaded_lrc_snapshot() {
+    loaded_lrc_snapshot snapshot;
+    if (g_doc.empty() || g_loaded_lrc_track_key.empty()) return snapshot;
+    snapshot.valid = true;
+    snapshot.track_key = g_loaded_lrc_track_key;
+    snapshot.document_hash = current_lyric_document_hash();
+    snapshot.dispatched_line_ids.reserve(g_dispatched_line_ids.size());
+    for (const uint64_t lineId : g_dispatched_line_ids) {
+        snapshot.dispatched_line_ids.push_back(lineId);
+    }
+    std::sort(snapshot.dispatched_line_ids.begin(), snapshot.dispatched_line_ids.end());
+    snapshot.last_dispatched_line_id = g_last_dispatched_line_id;
+    snapshot.last_dispatched_task_id = g_last_dispatched_task_id;
+    return snapshot;
+}
+
+void restore_last_spoken_if_same_lyrics(const loaded_lrc_snapshot& snapshot, metadb_handle_ptr track,
+    const wchar_t* source) {
+    if (!snapshot.valid || g_doc.empty()) return;
+    const std::wstring currentKey = track_key(track);
+    if (currentKey.empty() || currentKey != snapshot.track_key) return;
+    const uint64_t newHash = current_lyric_document_hash();
+    if (newHash != snapshot.document_hash) return;
+
+    g_dispatched_line_ids.clear();
+    for (const uint64_t lineId : snapshot.dispatched_line_ids) {
+        if (lineId != 0) g_dispatched_line_ids.insert(lineId);
+    }
+    g_last_dispatched_line_id = snapshot.last_dispatched_line_id;
+    g_last_dispatched_task_id = snapshot.last_dispatched_task_id;
+    g_last_scheduled_line_id = g_last_dispatched_line_id;
+    speaklyrics_log_info(
+        L"歌词重载：歌曲会话=%llu，歌词文档=%llu，来源=%s，检测到相同歌曲和相同歌词，保留已提交歌词行=%llu行，最后歌词行ID=%llu。",
+        static_cast<unsigned long long>(g_track_session_id),
+        static_cast<unsigned long long>(g_document_generation),
+        source ? source : L"未知",
+        static_cast<unsigned long long>(g_dispatched_line_ids.size()),
+        static_cast<unsigned long long>(g_last_dispatched_line_id));
+}
+
+void prune_recent_lyric_submissions(ULONGLONG now) {
+    g_recent_lyric_submissions.erase(
+        std::remove_if(g_recent_lyric_submissions.begin(), g_recent_lyric_submissions.end(),
+            [now](const lyric_submission_record& record) {
+                return now < record.submitted_at || now - record.submitted_at > 10000;
+            }),
+        g_recent_lyric_submissions.end());
+    constexpr size_t kMaximumRecentSubmissions = 128;
+    if (g_recent_lyric_submissions.size() > kMaximumRecentSubmissions) {
+        const size_t removeCount = g_recent_lyric_submissions.size() - kMaximumRecentSubmissions;
+        g_recent_lyric_submissions.erase(
+            g_recent_lyric_submissions.begin(), g_recent_lyric_submissions.begin() + removeCount);
+    }
+}
+
+void remove_recent_lyric_submission(uint64_t taskId) {
+    if (taskId == 0) return;
+    g_recent_lyric_submissions.erase(
+        std::remove_if(g_recent_lyric_submissions.begin(), g_recent_lyric_submissions.end(),
+            [taskId](const lyric_submission_record& record) {
+                return record.speech_task_id == taskId;
+            }),
+        g_recent_lyric_submissions.end());
+}
+
+void reset_last_spoken(const wchar_t* reason) {
+    speaklyrics_log_info(
+        L"朗读状态重置：歌曲会话=%llu，歌词文档=%llu，原计划歌词行ID=%llu，原提交歌词行ID=%llu，等待任务=%llu，原因=%s。",
+        static_cast<unsigned long long>(g_track_session_id),
+        static_cast<unsigned long long>(g_document_generation),
+        static_cast<unsigned long long>(g_last_scheduled_line_id),
+        static_cast<unsigned long long>(g_last_dispatched_line_id),
+        static_cast<unsigned long long>(g_pending_lyric_submissions.size()),
+        reason ? reason : L"未知");
+    g_last_scheduled_line_id = 0;
+    g_last_dispatched_line_id = 0;
+    g_last_dispatched_task_id = 0;
+    g_scheduler_scan_trigger_ms = -1;
+    g_pending_lyric_submissions.clear();
+    g_scheduled_line_ids.clear();
+    g_dispatched_line_ids.clear();
+    g_skipped_line_ids.clear();
+    g_retry_line_ids.clear();
+    g_last_lyric_submission = lyric_submission_record{};
+    g_last_skip_document_generation = 0;
+    g_last_skip_line_id = 0;
+    g_last_skip_reason = 0;
+}
+
+void advance_lyric_position_epoch(const wchar_t* reason) {
+    ++g_lyric_position_epoch;
+    if (g_lyric_position_epoch == 0) g_lyric_position_epoch = 1;
+    speaklyrics_log_info(L"歌词播放位置世代递增：歌曲会话=%llu，位置世代=%llu，原因=%s。",
+        static_cast<unsigned long long>(g_track_session_id),
+        static_cast<unsigned long long>(g_lyric_position_epoch),
+        reason ? reason : L"未知");
+}
+
+void recalculate_last_scheduled() {
+    uint64_t scheduled = g_last_dispatched_line_id;
+    uint64_t newestTaskId = g_last_dispatched_task_id;
+    const uint64_t playbackGeneration = speech_current_playback_generation();
+    for (const auto& pending : g_pending_lyric_submissions) {
+        if (pending.track_session != g_track_session_id ||
+            pending.playback_generation != playbackGeneration ||
+            pending.position_epoch != g_lyric_position_epoch) continue;
+        if (pending.speech_task_id >= newestTaskId) {
+            newestTaskId = pending.speech_task_id;
+            scheduled = pending.line_ids.empty() ? pending.line_id : pending.line_ids.back();
+        }
+    }
+    g_last_scheduled_line_id = scheduled;
+}
+
+void process_speech_task_results() {
+    std::vector<speech_task_result> results = speech_drain_task_results();
+    if (results.empty()) return;
+
+    const uint64_t activePlaybackGeneration = speech_current_playback_generation();
+    for (const auto& result : results) {
+        auto pending = std::find_if(g_pending_lyric_submissions.begin(),
+            g_pending_lyric_submissions.end(), [&result](const lyric_submission_record& record) {
+                return record.speech_task_id == result.task.task_id;
+            });
+
+        lyric_submission_record record;
+        if (pending != g_pending_lyric_submissions.end()) {
+            record = *pending;
+            g_pending_lyric_submissions.erase(pending);
+        } else {
+            record.track_session = result.task.track_session;
+            record.document_generation = result.task.document_generation;
+            record.playback_generation = result.task.playback_generation;
+            record.speech_task_id = result.task.task_id;
+            record.line_index = result.task.line_index;
+            record.line_id = result.task.line_id;
+            record.line_ids = result.task.line_ids;
+            if (record.line_ids.empty() && result.task.line_id != 0) {
+                record.line_ids.push_back(result.task.line_id);
+            }
+            record.position_epoch = result.task.position_epoch;
+            record.lyric_time_ms = result.task.lyric_time_ms;
+            record.trigger_time_ms = result.task.trigger_time_ms;
+            record.text_hash = result.task.text_hash;
+            record.submitted_at = result.task.queued_at;
+            record.expires_at = result.task.expires_at;
+        }
+
+        const bool belongsToCurrentTrack = record.track_session == g_track_session_id;
+        const bool belongsToCurrentPosition =
+            belongsToCurrentTrack &&
+            record.playback_generation == activePlaybackGeneration &&
+            record.position_epoch == g_lyric_position_epoch;
+        const bool belongsToCurrentDocument = belongsToCurrentPosition &&
+            record.document_generation == g_document_generation;
+        const bool belongsToCurrentLineState = belongsToCurrentTrack &&
+            record.document_generation == g_document_generation &&
+            record.position_epoch == g_lyric_position_epoch;
+
+        std::vector<uint64_t> recordLineIds = record.line_ids;
+        if (recordLineIds.empty() && record.line_id != 0) recordLineIds.push_back(record.line_id);
+
+        switch (result.status) {
+        case speech_task_result_status::dispatched:
+            if (belongsToCurrentTrack) ++g_track_diagnostics.dispatched;
+            if (belongsToCurrentLineState) {
+                for (const uint64_t lineId : recordLineIds) {
+                    if (lineId == 0) continue;
+                    g_scheduled_line_ids.erase(lineId);
+                    g_retry_line_ids.erase(lineId);
+                }
+            }
+            if (belongsToCurrentDocument) {
+                for (const uint64_t lineId : recordLineIds) {
+                    if (lineId != 0) g_dispatched_line_ids.insert(lineId);
+                }
+            }
+            if (belongsToCurrentDocument && record.speech_task_id >= g_last_dispatched_task_id) {
+                g_last_dispatched_line_id = recordLineIds.empty() ? record.line_id : recordLineIds.back();
+                g_last_dispatched_task_id = record.speech_task_id;
+            }
+            break;
+        case speech_task_result_status::failed:
+            if (belongsToCurrentTrack) ++g_track_diagnostics.failed;
+            if (belongsToCurrentLineState) {
+                for (const uint64_t lineId : recordLineIds) {
+                    if (lineId != 0) g_scheduled_line_ids.erase(lineId);
+                }
+            }
+            remove_recent_lyric_submission(record.speech_task_id);
+            if (belongsToCurrentLineState &&
+                (record.expires_at == 0 || GetTickCount64() < record.expires_at)) {
+                for (const uint64_t lineId : recordLineIds) {
+                    if (lineId != 0) g_retry_line_ids.insert(lineId);
+                }
+            }
+            break;
+        case speech_task_result_status::expired:
+            if (belongsToCurrentTrack) ++g_track_diagnostics.task_expired;
+            if (belongsToCurrentLineState) {
+                for (const uint64_t lineId : recordLineIds) {
+                    if (lineId == 0) continue;
+                    g_scheduled_line_ids.erase(lineId);
+                    g_retry_line_ids.erase(lineId);
+                    g_skipped_line_ids.insert(lineId);
+                }
+            }
+            remove_recent_lyric_submission(record.speech_task_id);
+            break;
+        case speech_task_result_status::canceled:
+            if (belongsToCurrentTrack) ++g_track_diagnostics.canceled;
+            if (belongsToCurrentLineState) {
+                for (const uint64_t lineId : recordLineIds) {
+                    if (lineId != 0) g_scheduled_line_ids.erase(lineId);
+                }
+            }
+            remove_recent_lyric_submission(record.speech_task_id);
+            if (belongsToCurrentLineState &&
+                (record.expires_at == 0 || GetTickCount64() < record.expires_at)) {
+                for (const uint64_t lineId : recordLineIds) {
+                    if (lineId != 0) g_retry_line_ids.insert(lineId);
+                }
+            }
+            break;
+        }
+
+        if (result.status != speech_task_result_status::dispatched &&
+            g_last_lyric_submission.speech_task_id == record.speech_task_id) {
+            g_last_lyric_submission = lyric_submission_record{};
+        }
+
+        recalculate_last_scheduled();
+        const wchar_t* resultText = L"未知";
+        switch (result.status) {
+        case speech_task_result_status::dispatched: resultText = L"已提交给语音接口"; break;
+        case speech_task_result_status::failed: resultText = L"失败"; break;
+        case speech_task_result_status::expired: resultText = L"过期"; break;
+        case speech_task_result_status::canceled: resultText = L"取消"; break;
+        }
+        speaklyrics_log_info(
+            L"朗读状态更新：任务=%llu，结果=%s，当前歌曲=%s，当前播放位置=%s，当前歌词文档=%s，位置世代=%llu，文档序号=%d，歌词行ID=%llu，关联歌词行=%llu，歌词时间=%d，触发时间=%d，计划歌词行ID=%llu，已提交歌词行ID=%llu，剩余等待=%llu。",
+            static_cast<unsigned long long>(record.speech_task_id),
+            resultText, belongsToCurrentTrack ? L"是" : L"否",
+            belongsToCurrentPosition ? L"是" : L"否",
+            belongsToCurrentDocument ? L"是" : L"否",
+            static_cast<unsigned long long>(record.position_epoch),
+            record.line_index, static_cast<unsigned long long>(record.line_id),
+            static_cast<unsigned long long>(recordLineIds.size()),
+            record.lyric_time_ms, record.trigger_time_ms,
+            static_cast<unsigned long long>(g_last_scheduled_line_id),
+            static_cast<unsigned long long>(g_last_dispatched_line_id),
+            static_cast<unsigned long long>(g_pending_lyric_submissions.size()));
+    }
+}
+
+void mark_document_loaded(const wchar_t* source) {
+    ++g_document_generation;
+    size_t duplicateTimestamps = 0;
+    size_t denseIntervals = 0;
+    int minimumPositiveInterval = -1;
+    int previousTime = -1;
+    for (size_t index = 0; index < g_doc.count(); ++index) {
+        const lrc_line* line = g_doc.get(index);
+        if (!line) continue;
+        if (previousTime >= 0) {
+            const int interval = line->time_ms - previousTime;
+            if (interval == 0) {
+                ++duplicateTimestamps;
+            } else if (interval > 0) {
+                if (interval < 1000) ++denseIntervals;
+                if (minimumPositiveInterval < 0 || interval < minimumPositiveInterval) minimumPositiveInterval = interval;
+            }
+        }
+        previousTime = line->time_ms;
+    }
+
+    speaklyrics_log_info(
+        L"歌词文档加载：歌曲会话=%llu，歌词文档=%llu，来源=%s，歌词行=%llu，重复时间戳=%llu，小于1秒间隔=%llu，最短正间隔=%d毫秒。",
+        static_cast<unsigned long long>(g_track_session_id),
+        static_cast<unsigned long long>(g_document_generation),
+        source ? source : L"未知",
+        static_cast<unsigned long long>(g_doc.count()),
+        static_cast<unsigned long long>(duplicateTimestamps),
+        static_cast<unsigned long long>(denseIntervals), minimumPositiveInterval);
+    if (duplicateTimestamps > 0) {
+        speaklyrics_log_info(L"歌词文档诊断：歌词文档=%llu 含有 %llu 个重复时间戳；自动朗读会按原文件顺序合并为同一个语音任务。",
+            static_cast<unsigned long long>(g_document_generation),
+            static_cast<unsigned long long>(duplicateTimestamps));
+    }
+    if (denseIntervals > 0) {
+        speaklyrics_log_info(L"歌词文档诊断：歌词文档=%llu 含有 %llu 个小于1秒的间隔；播放回调跨过多句时会按顺序补交仍在有效时间内的歌词组。",
+            static_cast<unsigned long long>(g_document_generation),
+            static_cast<unsigned long long>(denseIntervals));
+    }
+}
+
+void clear_loaded_lrc(const wchar_t* reason) {
+
+    reset_last_spoken(reason);
     g_doc.clear();
+
+    g_loaded_lrc_track_key.clear();
 
     g_current_lrc.clear();
 
     g_current_lrc_temporary = false;
 
-    g_last_spoken = -1;
-
 }
 
 
 
-void load_for_track(metadb_handle_ptr track);
+void load_for_track(metadb_handle_ptr track, const wchar_t* reason);
 
 
 
@@ -1166,13 +1956,16 @@ int lyric_valid_ms() {
 
 
 
-bool retry_load_missing_lrc(double seconds) {
+bool retry_load_missing_lrc(double) {
 
     if (!g_doc.empty() || g_paused) return false;
 
-    if ((seconds - g_last_missing_lrc_retry_time) * 1000.0 < static_cast<double>(missing_lrc_retry_ms())) return false;
-
-    g_last_missing_lrc_retry_time = seconds;
+    const ULONGLONG now = GetTickCount64();
+    if (g_last_missing_lrc_scan_tick != 0 &&
+        now - g_last_missing_lrc_scan_tick < static_cast<ULONGLONG>(missing_lrc_retry_ms())) {
+        return false;
+    }
+    g_last_missing_lrc_scan_tick = now;
 
 
 
@@ -1182,7 +1975,7 @@ bool retry_load_missing_lrc(double seconds) {
 
 
 
-    load_for_track(track);
+    load_for_track(track, L"无歌词后台扫描重试");
 
     return !g_doc.empty();
 
@@ -1190,17 +1983,22 @@ bool retry_load_missing_lrc(double seconds) {
 
 
 
-void load_for_track(metadb_handle_ptr track) {
+void load_for_track(metadb_handle_ptr track, const wchar_t* reason) {
 
     process_pending_temp_lrc_deletes();
 
-    clear_loaded_lrc();
+    const loaded_lrc_snapshot previous = capture_loaded_lrc_snapshot();
+
+    clear_loaded_lrc(reason);
 
     auto found = find_lrc_for_track(track);
 
     if (!found) {
-
-        speaklyrics_log_warning(L"歌词加载：未找到可用 LRC，准备按设置尝试下载。");
+        const std::wstring key = track_key(track);
+        if (!g_lrc_download_state.is_for(key) ||
+            g_lrc_download_state.status == lrc_download_status::idle) {
+            speaklyrics_log_warning(L"歌词加载：未找到可用 LRC，准备按设置尝试下载。");
+        }
         maybe_start_lrc_downloader(track);
 
         refresh_lyrics_jump_window();
@@ -1213,6 +2011,9 @@ void load_for_track(metadb_handle_ptr track) {
 
     if (!found->embedded_text.empty()) {
         if (g_doc.load_text(found->embedded_text, L"<LYRICS>", error)) {
+            g_loaded_lrc_track_key = track_key(track);
+            mark_document_loaded(L"音频文件内嵌 LYRICS 标签");
+            restore_last_spoken_if_same_lyrics(previous, track, L"音频文件内嵌 LYRICS 标签");
             speaklyrics_log_info(
                 L"歌词加载：已加载音频文件内嵌 LYRICS 标签，共 %llu 行。",
                 static_cast<unsigned long long>(g_doc.count()));
@@ -1232,6 +2033,10 @@ void load_for_track(metadb_handle_ptr track) {
         g_current_lrc = found->path;
 
         g_current_lrc_temporary = found->temporary;
+        g_loaded_lrc_track_key = track_key(track);
+        mark_document_loaded(found->temporary ? L"临时歌词目录 LRC" : L"本地或指定目录 LRC");
+        restore_last_spoken_if_same_lyrics(previous, track,
+            found->temporary ? L"临时歌词目录 LRC" : L"本地或指定目录 LRC");
 
         if (g_current_lrc_temporary) cancel_pending_temp_lrc_delete(g_current_lrc);
 
@@ -1282,51 +2087,333 @@ int estimate_lyric_speech_ms(const std::wstring& text) {
     return (std::clamp)(estimate, 900, 6000);
 }
 
-void speak_for_time(double seconds) {
+enum class lyric_submit_status {
+    accepted,
+    duplicate,
+    expired,
+    rejected,
+};
+
+void log_skipped_lyric_once(int reason, const lyric_schedule_item& item, int playbackMs,
+    const wchar_t* reasonText) {
+    if (g_last_skip_document_generation == g_document_generation &&
+        g_last_skip_line_id == item.line_id && g_last_skip_reason == reason) return;
+
+    g_last_skip_document_generation = g_document_generation;
+    g_last_skip_line_id = item.line_id;
+    g_last_skip_reason = reason;
+    if (reason == 1) ++g_track_diagnostics.expired_lines;
+
+    const std::wstring excerpt = speaklyrics_log_text_excerpt(item.text.c_str());
+    speaklyrics_log_warning(
+        L"歌词跳过：歌曲会话=%llu，歌词文档=%llu，文档序号=%llu，歌词行ID=%llu，播放时间=%d，歌词时间=%d，触发时间=%d，落后=%d毫秒，原因=%s，文本哈希=%016llX，内容=%s。",
+        static_cast<unsigned long long>(g_track_session_id),
+        static_cast<unsigned long long>(g_document_generation),
+        static_cast<unsigned long long>(item.document_index),
+        static_cast<unsigned long long>(item.line_id),
+        playbackMs, item.lyric_time_ms, item.trigger_time_ms,
+        playbackMs - item.lyric_time_ms,
+        reasonText ? reasonText : L"未知",
+        static_cast<unsigned long long>(speaklyrics_log_text_hash(item.text.c_str())),
+        excerpt.c_str());
+}
+
+void log_crossed_lyrics_if_needed(size_t dueCount, size_t groupCount,
+    int previousTriggerMs, int playbackMs, const wchar_t* mode) {
+    if (dueCount <= 1 && groupCount <= 1) return;
+    const size_t crossed = groupCount > 1 ? groupCount - 1 : 0;
+    g_track_diagnostics.crossed_lines += static_cast<uint64_t>(crossed);
+    speaklyrics_log_warning(
+        L"时间轴批量调度：歌曲会话=%llu，歌词文档=%llu，位置世代=%llu，扫描区间起点=%d，播放时间=%d，发现到期=%llu行，共%llu个歌词组，模式=%s；同时间戳多行合并，跨越的歌词组按原始顺序补交。",
+        static_cast<unsigned long long>(g_track_session_id),
+        static_cast<unsigned long long>(g_document_generation),
+        static_cast<unsigned long long>(g_lyric_position_epoch),
+        previousTriggerMs, playbackMs,
+        static_cast<unsigned long long>(dueCount),
+        static_cast<unsigned long long>(groupCount), mode ? mode : L"未知");
+}
+
+std::vector<uint64_t> schedule_group_line_ids(
+    const std::vector<lyric_schedule_item>& schedule,
+    const std::vector<size_t>& group) {
+    std::vector<uint64_t> lineIds;
+    lineIds.reserve(group.size());
+    for (const size_t index : group) {
+        if (index >= schedule.size() || schedule[index].line_id == 0) continue;
+        lineIds.push_back(schedule[index].line_id);
+    }
+    return lineIds;
+}
+
+std::wstring schedule_group_text(
+    const std::vector<lyric_schedule_item>& schedule,
+    const std::vector<size_t>& group) {
+    std::wstring text;
+    for (const size_t index : group) {
+        if (index >= schedule.size() || schedule[index].text.empty()) continue;
+        if (!text.empty()) text += L"\r\n";
+        text += schedule[index].text;
+    }
+    return text;
+}
+
+bool recent_submission_matches(const lyric_schedule_item& item,
+    const std::vector<uint64_t>& lineIds, uint64_t textHash,
+    ULONGLONG now, lyric_submission_record& matched) {
+    prune_recent_lyric_submissions(now);
+    for (const auto& record : g_recent_lyric_submissions) {
+        if (record.track_session != g_track_session_id ||
+            record.position_epoch != g_lyric_position_epoch ||
+            record.lyric_time_ms != item.lyric_time_ms ||
+            record.text_hash != textHash ||
+            now < record.submitted_at || now - record.submitted_at > 10000) continue;
+
+        std::vector<uint64_t> recordLineIds = record.line_ids;
+        if (recordLineIds.empty() && record.line_id != 0) recordLineIds.push_back(record.line_id);
+        const bool sameStableLines = !lineIds.empty() && recordLineIds == lineIds;
+        const bool documentChanged = record.document_generation != g_document_generation;
+        const bool fallbackKey = documentChanged || recordLineIds.empty() || lineIds.empty();
+        if (sameStableLines || fallbackKey) {
+            matched = record;
+            return true;
+        }
+    }
+    return false;
+}
+
+lyric_submit_status submit_lyric_group_with_diagnostics(
+    const std::vector<lyric_schedule_item>& schedule,
+    const std::vector<size_t>& group, int playbackMs, bool interrupt) {
+    if (group.empty() || group.front() >= schedule.size()) return lyric_submit_status::rejected;
+
+    const lyric_schedule_item& item = schedule[group.front()];
+    const std::wstring text = schedule_group_text(schedule, group);
+    const std::vector<uint64_t> lineIds = schedule_group_line_ids(schedule, group);
+    if (text.empty()) return lyric_submit_status::rejected;
+
+    const uint64_t textHash = speaklyrics_log_text_hash(text.c_str());
+    const ULONGLONG now = GetTickCount64();
+    lyric_submission_record duplicate;
+    if (recent_submission_matches(item, lineIds, textHash, now, duplicate)) {
+        ++g_track_diagnostics.suspected_duplicates;
+        for (const uint64_t lineId : lineIds) {
+            g_dispatched_line_ids.insert(lineId);
+            g_retry_line_ids.erase(lineId);
+        }
+        speaklyrics_log_warning(
+            L"疑似重复朗读已抑制：歌曲会话=%llu，当前位置世代=%llu，当前歌词文档=%llu，上次歌词文档=%llu，文档序号=%llu，首行ID=%llu，歌词组=%llu行，歌词时间=%d，触发时间=%d，上次任务=%llu，间隔=%llu毫秒，文本哈希=%016llX，内容=%s。",
+            static_cast<unsigned long long>(g_track_session_id),
+            static_cast<unsigned long long>(g_lyric_position_epoch),
+            static_cast<unsigned long long>(g_document_generation),
+            static_cast<unsigned long long>(duplicate.document_generation),
+            static_cast<unsigned long long>(item.document_index),
+            static_cast<unsigned long long>(item.line_id),
+            static_cast<unsigned long long>(lineIds.size()), item.lyric_time_ms,
+            item.trigger_time_ms,
+            static_cast<unsigned long long>(duplicate.speech_task_id),
+            static_cast<unsigned long long>(now - duplicate.submitted_at),
+            static_cast<unsigned long long>(textHash),
+            speaklyrics_log_text_excerpt(text.c_str()).c_str());
+        return lyric_submit_status::duplicate;
+    }
+
+    ++g_track_diagnostics.planned;
+    lyric_speech_diagnostic_context diagnostic;
+    diagnostic.track_session = g_track_session_id;
+    diagnostic.document_generation = g_document_generation;
+    diagnostic.line_index = static_cast<int>(item.document_index);
+    diagnostic.line_id = item.line_id;
+    diagnostic.line_ids = lineIds;
+    diagnostic.position_epoch = g_lyric_position_epoch;
+    diagnostic.lyric_time_ms = item.lyric_time_ms;
+    diagnostic.trigger_time_ms = item.trigger_time_ms;
+    diagnostic.playback_time_ms = playbackMs;
+    const speech_enqueue_result enqueueResult = speech_queue_lyric(text.c_str(), interrupt,
+        static_cast<unsigned>(lyric_valid_ms()), diagnostic);
+    if (!enqueueResult.accepted()) {
+        ++g_track_diagnostics.rejected;
+        if (enqueueResult.status == speech_enqueue_status::expired) {
+            ++g_track_diagnostics.task_expired;
+            return lyric_submit_status::expired;
+        }
+        return lyric_submit_status::rejected;
+    }
+
+    ++g_track_diagnostics.accepted;
+    lyric_submission_record record;
+    record.track_session = g_track_session_id;
+    record.document_generation = g_document_generation;
+    record.playback_generation = enqueueResult.playback_generation;
+    record.speech_task_id = enqueueResult.task_id;
+    record.line_index = static_cast<int>(item.document_index);
+    record.line_id = item.line_id;
+    record.line_ids = lineIds;
+    record.position_epoch = g_lyric_position_epoch;
+    record.lyric_time_ms = item.lyric_time_ms;
+    record.trigger_time_ms = item.trigger_time_ms;
+    record.text_hash = textHash;
+    record.submitted_at = now;
+    record.expires_at = enqueueResult.expires_at;
+    g_pending_lyric_submissions.push_back(record);
+    g_recent_lyric_submissions.push_back(record);
+    prune_recent_lyric_submissions(now);
+    for (const uint64_t lineId : lineIds) {
+        g_scheduled_line_ids.insert(lineId);
+        g_retry_line_ids.erase(lineId);
+    }
+    g_last_lyric_submission = record;
+    g_last_scheduled_line_id = lineIds.empty() ? item.line_id : lineIds.back();
+    return lyric_submit_status::accepted;
+}
+
+void mark_expired_schedule_item(const lyric_schedule_item& item, int playbackMs,
+    const wchar_t* reason) {
+    if (item.line_id != 0) {
+        g_skipped_line_ids.insert(item.line_id);
+        g_retry_line_ids.erase(item.line_id);
+    }
+    log_skipped_lyric_once(1, item, playbackMs, reason);
+}
+
+void speak_for_time(double seconds, bool seekOnly = false) {
+    process_speech_task_results();
 
     if (!cfg_auto_speak.get() || g_paused || g_doc.empty()) return;
 
-    int offset = static_cast<int>(cfg_lead_ms.get());
+    const int offset = static_cast<int>(cfg_lead_ms.get());
+    const int playbackMs = static_cast<int>(seconds * 1000.0) - offset;
+    const std::vector<lyric_schedule_item> schedule = get_current_lyric_schedule_items();
+    if (schedule.empty()) return;
 
-    int ms = static_cast<int>(seconds * 1000.0) - offset;
+    std::unordered_set<uint64_t> handledLineIds;
+    handledLineIds.reserve(g_scheduled_line_ids.size() + g_dispatched_line_ids.size() +
+        g_skipped_line_ids.size());
+    handledLineIds.insert(g_scheduled_line_ids.begin(), g_scheduled_line_ids.end());
+    handledLineIds.insert(g_dispatched_line_ids.begin(), g_dispatched_line_ids.end());
+    handledLineIds.insert(g_skipped_line_ids.begin(), g_skipped_line_ids.end());
 
-    int currentIndex = g_doc.find_index_for_time(ms);
-    int spokenIndex = currentIndex;
+    auto unhandled_group = [&](const std::vector<size_t>& group) {
+        std::vector<size_t> result;
+        result.reserve(group.size());
+        for (const size_t index : group) {
+            if (index >= schedule.size()) continue;
+            const uint64_t lineId = schedule[index].line_id;
+            if (lineId != 0 && handledLineIds.find(lineId) != handledLineIds.end()) continue;
+            result.push_back(index);
+        }
+        return result;
+    };
+
+    auto remember_group = [&](const std::vector<size_t>& group) {
+        for (const size_t index : group) {
+            if (index >= schedule.size()) continue;
+            const uint64_t lineId = schedule[index].line_id;
+            if (lineId != 0) handledLineIds.insert(lineId);
+        }
+    };
+
+    auto retry_group = [&](const std::vector<size_t>& group) {
+        for (const size_t index : group) {
+            if (index >= schedule.size()) continue;
+            const uint64_t lineId = schedule[index].line_id;
+            if (lineId != 0) g_retry_line_ids.insert(lineId);
+        }
+    };
+
+    auto submit_group = [&](const std::vector<size_t>& rawGroup, bool& interrupt) {
+        const std::vector<size_t> group = unhandled_group(rawGroup);
+        if (group.empty()) return true;
+
+        const lyric_schedule_item& first = schedule[group.front()];
+        if (playbackMs - first.lyric_time_ms >= lyric_valid_ms()) {
+            for (const size_t index : group) {
+                mark_expired_schedule_item(schedule[index], playbackMs,
+                    L"超过歌词朗读有效时间");
+            }
+            remember_group(group);
+            return true;
+        }
+
+        const lyric_submit_status status = submit_lyric_group_with_diagnostics(
+            schedule, group, playbackMs, interrupt);
+        if (status == lyric_submit_status::accepted) {
+            interrupt = false;
+            remember_group(group);
+        } else if (status == lyric_submit_status::duplicate) {
+            remember_group(group);
+        } else if (status == lyric_submit_status::expired) {
+            for (const size_t index : group) {
+                mark_expired_schedule_item(schedule[index], playbackMs,
+                    L"语音任务入队前已经过期");
+            }
+            remember_group(group);
+        } else {
+            retry_group(group);
+            return false;
+        }
+        return true;
+    };
+
+    if (seekOnly) {
+        const std::vector<size_t> group = lyric_scheduler::find_latest_seek_group(schedule, playbackMs);
+        g_scheduler_scan_trigger_ms = playbackMs;
+        if (group.empty()) return;
+
+        speaklyrics_log_info(
+            L"播放跳转调度：歌曲会话=%llu，歌词文档=%llu，位置世代=%llu，目标播放时间=%d，目标歌词时间=%d，目标歌词组=%llu行；只处理目标组，不补读跳过区间。",
+            static_cast<unsigned long long>(g_track_session_id),
+            static_cast<unsigned long long>(g_document_generation),
+            static_cast<unsigned long long>(g_lyric_position_epoch), playbackMs,
+            schedule[group.front()].lyric_time_ms,
+            static_cast<unsigned long long>(group.size()));
+
+        bool interrupt = true;
+        submit_group(group, interrupt);
+        return;
+    }
+
+    if (playbackMs < g_scheduler_scan_trigger_ms) {
+        speaklyrics_log_warning(
+            L"歌词调度时间倒退：歌曲会话=%llu，旧扫描时间=%d，当前扫描时间=%d；等待显式跳转事件重新建立播放世代。",
+            static_cast<unsigned long long>(g_track_session_id),
+            g_scheduler_scan_trigger_ms, playbackMs);
+        return;
+    }
+
+    const int previousTriggerMs = g_scheduler_scan_trigger_ms;
+    const std::vector<size_t> due = lyric_scheduler::collect_due_indices(
+        schedule, previousTriggerMs, playbackMs, handledLineIds, g_retry_line_ids);
+    if (due.empty()) {
+        g_scheduler_scan_trigger_ms = playbackMs;
+        return;
+    }
+
     pfc::string8 configuredMode = cfg_lyric_speak_mode.get();
     const bool advanceMode = _stricmp(configuredMode.get_ptr(), "advance") == 0;
+    const std::vector<std::vector<size_t>> groups =
+        lyric_scheduler::group_indices_by_event(schedule, due);
+    log_crossed_lyrics_if_needed(due.size(), groups.size(), previousTriggerMs, playbackMs,
+        advanceMode ? L"动态提前朗读" : L"时间戳朗读");
 
-    if (advanceMode) {
-        std::vector<lyric_jump_item> items = filter_leading_lyric_credits(get_current_lyric_jump_items());
-        spokenIndex = -1;
-        for (size_t i = 0; i < items.size(); ++i) {
-            int speakTime = (std::max)(0, items[i].time_ms - estimate_lyric_speech_ms(items[i].text));
-            if (i > 0) speakTime = (std::max)(speakTime, items[i - 1].time_ms);
-            if (speakTime <= ms) spokenIndex = static_cast<int>(i);
+    bool interrupt = true;
+    for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
+        if (submit_group(groups[groupIndex], interrupt)) continue;
+
+        size_t deferredLines = 0;
+        for (size_t remaining = groupIndex + 1; remaining < groups.size(); ++remaining) {
+            retry_group(groups[remaining]);
+            deferredLines += groups[remaining].size();
         }
-        if (spokenIndex < 0 || spokenIndex == g_last_spoken) return;
-
-        const lyric_jump_item& item = items[static_cast<size_t>(spokenIndex)];
-        if (ms - item.time_ms > lyric_valid_ms()) return;
-        speech_queue_lyric(item.text.c_str(), true, static_cast<unsigned>(lyric_valid_ms()));
-        g_last_spoken = spokenIndex;
-        return;
-    } else {
-        if (currentIndex < 0) return;
-        const lrc_line* triggerLine = g_doc.get(static_cast<size_t>(currentIndex));
-        if (triggerLine && ms - triggerLine->time_ms > lyric_valid_ms()) return;
+        speaklyrics_log_warning(
+            L"歌词组入队受阻：歌曲会话=%llu，歌词文档=%llu，位置世代=%llu，受阻组序号=%llu，后续待重试=%llu行；本轮停止提交，避免后面的歌词越过较早歌词。",
+            static_cast<unsigned long long>(g_track_session_id),
+            static_cast<unsigned long long>(g_document_generation),
+            static_cast<unsigned long long>(g_lyric_position_epoch),
+            static_cast<unsigned long long>(groupIndex + 1),
+            static_cast<unsigned long long>(deferredLines));
+        break;
     }
-
-    if (spokenIndex < 0 || spokenIndex == g_last_spoken) return;
-    const lrc_line* line = g_doc.get(static_cast<size_t>(spokenIndex));
-
-    if (line && !line->text.empty()) {
-
-        speech_queue_lyric(line->text.c_str(), true, static_cast<unsigned>(lyric_valid_ms()));
-
-        g_last_spoken = spokenIndex;
-
-    }
-
+    g_scheduler_scan_trigger_ms = playbackMs;
 }
 
 
@@ -1355,7 +2442,13 @@ public:
 
     void on_playback_new_track(metadb_handle_ptr p_track) override {
 
-        speech_invalidate_pending();
+        cancel_playback_background_tasks();
+        speech_invalidate_pending(speech_invalidation_reason::track_change);
+        process_speech_task_results();
+        log_track_diagnostic_summary(L"切换歌曲");
+        ++g_track_session_id;
+        advance_lyric_position_epoch(L"切换歌曲");
+        reset_track_diagnostic_state();
 
         g_paused = false;
 
@@ -1370,16 +2463,20 @@ public:
         }
 
         g_current_track_key = newKey;
+        g_lyric_match_fingerprint = make_lyric_match_fingerprint(p_track);
+        g_ignored_metadata_update_logged = false;
+        downloader_track_info trackInfo = get_downloader_track_info(p_track);
+        speaklyrics_log_info(L"歌词诊断开始：歌曲会话=%llu，标题=%s，艺术家=%s。",
+            static_cast<unsigned long long>(g_track_session_id),
+            trackInfo.title.c_str(), trackInfo.artist.c_str());
 
-        g_last_missing_lrc_retry_time = -1000.0;
-
-        g_downloader_requested_track_key.clear();
+        g_last_missing_lrc_scan_tick = 0;
 
         g_same_title_candidate_index = 0;
         g_same_title_switch_in_progress = false;
         clear_same_title_candidate_cache();
 
-        load_for_track(p_track);
+        load_for_track(p_track, L"切换歌曲");
 
         bool announced = queue_or_speak_track_announcement(p_track);
 
@@ -1388,60 +2485,122 @@ public:
     }
 
     void on_playback_stop(play_control::t_stop_reason) override {
+        cancel_playback_background_tasks();
+        speech_invalidate_pending(speech_invalidation_reason::playback_stop);
+        process_speech_task_results();
+        advance_lyric_position_epoch(L"停止播放");
+        log_track_diagnostic_summary(L"停止播放");
 
-        g_last_missing_lrc_retry_time = -1000.0;
-
-        g_downloader_requested_track_key.clear();
+        g_last_missing_lrc_scan_tick = 0;
 
         clear_same_title_candidate_cache();
 
         cancel_pending_track_announcement();
 
-        speech_queue_silence();
-
     }
 
     void on_playback_seek(double p_time) override {
 
-        speech_invalidate_pending();
+        speech_invalidate_pending(speech_invalidation_reason::playback_seek);
+        process_speech_task_results();
 
-        g_last_spoken = -1;
+        advance_lyric_position_epoch(L"播放位置跳转");
+        reset_last_spoken(L"播放位置跳转");
+        g_last_playback_callback_time = p_time;
 
-        speak_for_time(p_time);
+        speak_for_time(p_time, true);
 
     }
 
     void on_playback_pause(bool p_state) override {
 
+        const bool wasPaused = g_paused;
         g_paused = p_state;
 
-        if (p_state) {
+        if (p_state && !wasPaused) {
             cancel_pending_track_announcement();
-            speech_queue_silence();
+            speech_invalidate_pending(speech_invalidation_reason::playback_pause);
+            process_speech_task_results();
+            advance_lyric_position_epoch(L"暂停播放");
+            reset_last_spoken(L"暂停播放，等待恢复后重新调度当前歌词");
+            return;
+        }
+
+        if (!p_state && wasPaused) {
+            auto playback = static_api_ptr_t<playback_control>();
+            if (!playback->is_playing()) return;
+
+            const double position = playback->playback_get_position();
+            g_last_playback_callback_time = position;
+            speaklyrics_log_info(
+                L"恢复播放调度：歌曲会话=%llu，歌词文档=%llu，位置世代=%llu，播放时间=%.3f；只重新调度当前歌词组。",
+                static_cast<unsigned long long>(g_track_session_id),
+                static_cast<unsigned long long>(g_document_generation),
+                static_cast<unsigned long long>(g_lyric_position_epoch), position);
+            speak_for_time(position, true);
         }
 
     }
 
     void on_playback_edited(metadb_handle_ptr p_track) override {
 
-        if (p_track.is_empty() || track_key(p_track) != g_current_track_key) return;
+        if (p_track.is_empty()) return;
 
-        speech_invalidate_pending();
+        const std::wstring editedTrackKey = track_key(p_track);
+        if (editedTrackKey.empty()) return;
+
+        // on_playback_edited() is expected to describe the current track, but
+        // verify it here so a stale notification cannot change the active
+        // lyric state. Using the now-playing key also allows a path change to
+        // be treated as a relevant matching-field change.
+        metadb_handle_ptr nowPlaying;
+        const bool hasNowPlaying = static_api_ptr_t<playback_control>()->get_now_playing(nowPlaying);
+        const std::wstring nowPlayingKey = hasNowPlaying ? track_key(nowPlaying) : std::wstring();
+        if (hasNowPlaying) {
+            if (nowPlayingKey.empty() || editedTrackKey != nowPlayingKey) return;
+        } else if (editedTrackKey != g_current_track_key) {
+            return;
+        }
+
+        const lyric_match_fingerprint currentFingerprint = make_lyric_match_fingerprint(p_track);
+        const unsigned changedFields = lyric_match_fingerprint_difference(
+            g_lyric_match_fingerprint, currentFingerprint);
+        if (changedFields == lyric_match_field_none) {
+            if (!g_ignored_metadata_update_logged) {
+                speaklyrics_log_info(
+                    L"标签更新：歌词匹配字段未变化，忽略本次标签通知；评论、评分、播放次数和播放统计等无关字段不会重新加载歌词。");
+                g_ignored_metadata_update_logged = true;
+            }
+            return;
+        }
+
+        const bool trackPathChanged = editedTrackKey != g_current_track_key;
+        if (trackPathChanged) {
+            schedule_current_temp_lrc_delete();
+            g_current_track_key = editedTrackKey;
+        }
+        g_lyric_match_fingerprint = currentFingerprint;
+        g_ignored_metadata_update_logged = false;
+
+        speech_invalidate_pending(speech_invalidation_reason::metadata_change);
+        process_speech_task_results();
+        cancel_playback_background_tasks();
 
         // Tag edits can supply the missing artist while the same song keeps
         // playing. Drop any title-only temporary candidate and rerun matching
         // immediately with foobar2000's updated metadata.
         delete_current_temp_lrc();
-        clear_loaded_lrc();
-        g_last_missing_lrc_retry_time = -1000.0;
-        g_downloader_requested_track_key.clear();
+        g_last_missing_lrc_scan_tick = 0;
         g_same_title_candidate_index = 0;
         g_same_title_switch_in_progress = false;
         clear_same_title_candidate_cache();
 
         downloader_track_info info = get_downloader_track_info(p_track);
-        speaklyrics_log_info(L"标签更新：重新匹配当前歌曲，标题：%s，艺术家：%s。", info.title.c_str(), info.artist.c_str());
-        load_for_track(p_track);
+        const std::wstring changedFieldNames = lyric_match_field_names(changedFields);
+        speaklyrics_log_info(
+            L"标签更新：检测到影响歌词匹配的字段发生变化（%s），重新匹配当前歌曲，标题：%s，艺术家：%s。",
+            changedFieldNames.c_str(), info.title.c_str(), info.artist.c_str());
+        load_for_track(p_track, L"当前歌曲标签更新");
 
     }
 
@@ -1451,13 +2610,35 @@ public:
 
     void on_playback_time(double p_time) override {
 
+        if (g_last_playback_callback_time >= 0.0 && p_time >= g_last_playback_callback_time) {
+            const int callbackIntervalMs = static_cast<int>((p_time - g_last_playback_callback_time) * 1000.0);
+            if (callbackIntervalMs > 2200) {
+                ++g_track_diagnostics.delayed_callbacks;
+                speaklyrics_log_warning(
+                    L"播放时间回调延迟：歌曲会话=%llu，上次时间=%.3f，当前时间=%.3f，间隔=%d毫秒；调度器将检查并补交区间内仍有效的歌词组。",
+                    static_cast<unsigned long long>(g_track_session_id),
+                    g_last_playback_callback_time, p_time, callbackIntervalMs);
+            }
+        }
+        g_last_playback_callback_time = p_time;
+
         process_pending_temp_lrc_deletes();
 
         process_pending_track_announcement();
 
         retry_load_missing_lrc(p_time);
 
-        if (!g_pending_track_announce_text.empty()) return;
+        if (!g_pending_track_announce_text.empty()) {
+            if (!g_pending_announcement_skip_logged && cfg_auto_speak.get() && !g_doc.empty()) {
+                ++g_track_diagnostics.announcement_blocks;
+                g_pending_announcement_skip_logged = true;
+                speaklyrics_log_warning(
+                    L"歌词暂缓：歌曲会话=%llu，播放时间=%.3f，原因=等待切换歌曲信息播报；播报结束后会补交仍在有效时间内的歌词组。",
+                    static_cast<unsigned long long>(g_track_session_id), p_time);
+            }
+            return;
+        }
+        g_pending_announcement_skip_logged = false;
 
         speak_for_time(p_time);
 
@@ -1477,7 +2658,16 @@ play_callback_static_factory_t<playback_lyric_speaker> g_playback_factory;
 
 
 bool copy_current_lyrics_without_timestamps() {
-    if (g_doc.empty()) {
+    const ensure_current_lyrics_result prepared = ensure_current_lyrics_loaded_for_copy();
+    if (prepared == ensure_current_lyrics_result::no_playing_track) {
+        speech_queue_speak(L"\u5f53\u524d\u6ca1\u6709\u6b63\u5728\u64ad\u653e\u7684\u6b4c\u66f2", true);
+        return false;
+    }
+    if (prepared == ensure_current_lyrics_result::background_download_pending) {
+        speech_queue_speak(L"\u5f53\u524d\u6ca1\u6709\u5df2\u52a0\u8f7d\u7684LRC\u6b4c\u8bcd\uff0c\u6b63\u5728\u540e\u53f0\u83b7\u53d6\u6b4c\u8bcd", true);
+        return false;
+    }
+    if (prepared == ensure_current_lyrics_result::unavailable || g_doc.empty()) {
         speech_queue_speak(L"\u5f53\u524d\u6ca1\u6709\u5df2\u52a0\u8f7d\u7684LRC\u6b4c\u8bcd", true);
         return false;
     }
@@ -1571,24 +2761,47 @@ bool switch_same_title_lyrics(int direction) {
     std::wstring manifestPath = temp_lrc_manifest_path();
     if (!manifestPath.empty()) command += L" --manifest " + command_line_quote(manifestPath);
 
-    std::thread([command, exePath, requestedTrackKey, requestedTitle, candidateIndex, previousCandidateIndex, previousDirection]() {
-        std::string output;
-        DWORD exitCode = 3;
-        bool started = run_process_capture_stdout(command, exePath.parent_path(), output, exitCode);
+    auto task = speaklyrics_start_background_task(L"same-title lyric switch");
+    if (!task) {
+        g_same_title_switch_in_progress = false;
+        speaklyrics_log_warning(L"Background task skipped during shutdown.");
+        return false;
+    }
+    g_same_title_switch_task = task;
+    const uint64_t session = g_track_session_id;
+    speaklyrics_run_background_task(task,
+        [task, command, exePath, requestedTrackKey, requestedTitle, candidateIndex,
+            previousCandidateIndex, previousDirection, session](speaklyrics_background_task& background) {
+        const speaklyrics_process_result process = run_process_capture_stdout(
+            command, exePath.parent_path(), background.aborter(), 30000, 1024 * 1024);
         std::wstring path;
         std::wstring title;
         std::wstring artist;
-        if (started && exitCode == 0) parse_candidate_downloader_output(output, path, title, artist);
+        if (process.status == speaklyrics_process_status::completed && process.exit_code == 0) {
+            parse_candidate_downloader_output(process.output, path, title, artist);
+        }
 
-        fb2k::inMainThread([requestedTrackKey, requestedTitle, candidateIndex, previousCandidateIndex, previousDirection, exitCode, path, title, artist]() {
+        const speaklyrics_process_status status = process.status;
+        const DWORD processExitCode = process.exit_code;
+        const DWORD processErrorCode = process.error_code;
+        background.post_to_main_thread([task, requestedTrackKey, requestedTitle, candidateIndex,
+            previousCandidateIndex, previousDirection, session, status, processExitCode,
+            processErrorCode, path, title, artist]() {
+            if (g_same_title_switch_task.get() != task.get()) return;
+            g_same_title_switch_task.reset();
             g_same_title_switch_in_progress = false;
 
             metadb_handle_ptr currentTrack;
             if (!static_api_ptr_t<playback_control>()->get_now_playing(currentTrack) ||
-                track_key(currentTrack) != requestedTrackKey) return;
+                track_key(currentTrack) != requestedTrackKey || g_track_session_id != session) return;
 
-            if (exitCode != 0 || path.empty() || !fs::exists(path)) {
+            if (status != speaklyrics_process_status::completed || processExitCode != 0 ||
+                path.empty() || !fs::exists(path)) {
                 g_same_title_candidate_index = previousCandidateIndex;
+                speaklyrics_log_warning(
+                    L"同名歌词切换：进程未完成，状态=%s，退出码=%lu，错误码=%lu，序号：%d。",
+                    speaklyrics_process_status_name(status), processExitCode, processErrorCode,
+                    candidateIndex);
                 speaklyrics_log_warning(L"\u540c\u540d\u6b4c\u8bcd\u5207\u6362\uff1a\u672a\u627e\u5230\u5019\u9009\uff0c\u5e8f\u53f7\uff1a%d\u3002", candidateIndex);
                 speech_queue_speak(previousDirection ? L"\u6ca1\u6709\u627e\u5230\u4e0a\u4e00\u4e2a\u540c\u540d\u6b4c\u8bcd" : L"\u6ca1\u6709\u627e\u5230\u4e0b\u4e00\u4e2a\u540c\u540d\u6b4c\u8bcd", true);
                 return;
@@ -1603,10 +2816,14 @@ bool switch_same_title_lyrics(int direction) {
             }
 
             schedule_current_temp_lrc_delete();
+            speech_invalidate_pending(speech_invalidation_reason::same_title_lyrics);
+            process_speech_task_results();
+            reset_last_spoken(L"切换同名歌词候选");
             g_doc = std::move(candidateDocument);
             g_current_lrc = path;
             g_current_lrc_temporary = true;
-            g_last_spoken = -1;
+            g_loaded_lrc_track_key = requestedTrackKey;
+            mark_document_loaded(L"同名歌词候选");
             cancel_pending_temp_lrc_delete(g_current_lrc);
             refresh_lyrics_jump_window();
 
@@ -1615,7 +2832,7 @@ bool switch_same_title_lyrics(int direction) {
             speaklyrics_log_info(L"\u540c\u540d\u6b4c\u8bcd\u5207\u6362\uff1a\u5df2\u52a0\u8f7d\uff0c\u6807\u9898\uff1a%s\uff0c\u827a\u672f\u5bb6\uff1a%s\u3002", announcement.c_str(), artist.c_str());
             speech_queue_speak(announcement.c_str(), true);
         });
-    }).detach();
+    });
     return true;
 }
 
@@ -1633,10 +2850,106 @@ void reload_current_lyrics() {
 
     if (static_api_ptr_t<playback_control>()->get_now_playing(track)) {
 
-        load_for_track(track);
+        cancel_playback_background_tasks();
+        speech_invalidate_pending(speech_invalidation_reason::lyrics_reload);
+        process_speech_task_results();
+        load_for_track(track, L"手动刷新或设置变更");
 
     }
 
+}
+
+ensure_current_lyrics_result ensure_current_lyrics_loaded_for_copy() {
+    metadb_handle_ptr track;
+    if (!static_api_ptr_t<playback_control>()->get_now_playing(track) || track.is_empty()) {
+        speaklyrics_log_warning(L"复制歌词准备：当前没有正在播放的歌曲。");
+        return ensure_current_lyrics_result::no_playing_track;
+    }
+
+    const std::wstring currentTrackKey = track_key(track);
+    if (currentTrackKey.empty()) {
+        speaklyrics_log_warning(L"复制歌词准备：无法取得当前歌曲标识，不读取可能属于上一首歌曲的内存歌词。");
+        return ensure_current_lyrics_result::unavailable;
+    }
+
+    if (!g_doc.empty() && g_loaded_lrc_track_key == currentTrackKey) {
+        return ensure_current_lyrics_result::already_loaded;
+    }
+
+    process_pending_temp_lrc_deletes();
+    const bool replacingStaleDocument = !g_doc.empty() || !g_loaded_lrc_track_key.empty();
+    speaklyrics_log_info(
+        L"复制歌词准备：当前歌词为空或不属于正在播放的歌曲，开始同步检查已有本地、标签和临时歌词；内存歌词行=%llu，当前歌曲匹配=%s。",
+        static_cast<unsigned long long>(g_doc.count()),
+        g_loaded_lrc_track_key == currentTrackKey ? L"是" : L"否");
+
+    const auto found = find_lrc_for_track(track);
+    if (!found) {
+        maybe_start_lrc_downloader(track);
+        const bool downloadPending = lrc_download_in_progress_for(currentTrackKey);
+        speaklyrics_log_warning(
+            L"复制歌词准备：同步检查未找到可用歌词，后台下载状态=%s。",
+            downloadPending ? L"正在进行" : L"未启动");
+        return downloadPending
+            ? ensure_current_lyrics_result::background_download_pending
+            : ensure_current_lyrics_result::unavailable;
+    }
+
+    lrc_document candidateDocument;
+    pfc::string8 loadError;
+    const bool embedded = !found->embedded_text.empty();
+    const bool loaded = embedded
+        ? candidateDocument.load_text(found->embedded_text, L"<LYRICS>", loadError)
+        : candidateDocument.load(found->path, loadError);
+    if (!loaded) {
+        if (embedded) {
+            speaklyrics_log_error(
+                L"复制歌词准备：内嵌 LYRICS 标签解析失败：%s。",
+                pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr());
+        } else {
+            speaklyrics_log_error(
+                L"复制歌词准备：候选 LRC 解析失败：%s，文件：%s。",
+                pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr(),
+                found->path.c_str());
+        }
+        maybe_start_lrc_downloader(track);
+        const bool downloadPending = lrc_download_in_progress_for(currentTrackKey);
+        return downloadPending
+            ? ensure_current_lyrics_result::background_download_pending
+            : ensure_current_lyrics_result::unavailable;
+    }
+
+    if (replacingStaleDocument) {
+        speech_invalidate_pending(speech_invalidation_reason::lyrics_reload);
+        process_speech_task_results();
+        reset_last_spoken(L"复制歌词前发现旧歌曲或失效歌词状态");
+    }
+
+    schedule_current_temp_lrc_delete();
+    g_doc = std::move(candidateDocument);
+    g_current_lrc = embedded ? std::wstring() : found->path;
+    g_current_lrc_temporary = !embedded && found->temporary;
+    g_loaded_lrc_track_key = currentTrackKey;
+
+    const wchar_t* source = embedded
+        ? L"复制前刷新：音频文件内嵌 LYRICS 标签"
+        : (found->temporary
+            ? L"复制前刷新：临时歌词目录 LRC"
+            : L"复制前刷新：本地或指定目录 LRC");
+    mark_document_loaded(source);
+    if (g_current_lrc_temporary) cancel_pending_temp_lrc_delete(g_current_lrc);
+    refresh_lyrics_jump_window();
+
+    if (embedded) {
+        speaklyrics_log_info(
+            L"复制歌词准备：已同步加载当前歌曲的内嵌 LYRICS 标签，共 %llu 行。",
+            static_cast<unsigned long long>(g_doc.count()));
+    } else {
+        speaklyrics_log_info(
+            L"复制歌词准备：已同步加载当前歌曲的 LRC，共 %llu 行，文件：%s。",
+            static_cast<unsigned long long>(g_doc.count()), g_current_lrc.c_str());
+    }
+    return ensure_current_lyrics_result::loaded;
 }
 
 
@@ -1665,8 +2978,23 @@ void set_manual_lrc_file_for_current_track(const char* path) {
 
     bind_manual_lrc_to_current_track();
 
-    reload_current_lyrics();
+}
 
+void cancel_playback_background_tasks() {
+    if (g_lrc_downloader_task) {
+        g_lrc_downloader_task->cancel();
+        g_lrc_downloader_task.reset();
+    }
+    g_lrc_download_state.reset();
+    if (g_same_title_prefetch_task) {
+        g_same_title_prefetch_task->cancel();
+        g_same_title_prefetch_task.reset();
+    }
+    if (g_same_title_switch_task) {
+        g_same_title_switch_task->cancel();
+        g_same_title_switch_task.reset();
+    }
+    g_same_title_switch_in_progress = false;
 }
 
 std::vector<lyric_jump_item> get_current_lyric_jump_items() {
@@ -1676,9 +3004,74 @@ std::vector<lyric_jump_item> get_current_lyric_jump_items() {
     for (size_t i = 0; i < g_doc.count(); ++i) {
         const lrc_line* line = g_doc.get(i);
         if (!line || line->text.empty()) continue;
-        items.push_back({ line->time_ms, line->text });
+        items.push_back({ line->time_ms, line->text, line->line_id, i });
     }
     return items;
+}
+
+std::vector<lyric_schedule_item> get_current_lyric_schedule_items() {
+    std::vector<lyric_jump_item> sourceItems = get_current_lyric_jump_items();
+    if (sourceItems.empty()) return {};
+
+    pfc::string8 configuredMode = cfg_lyric_speak_mode.get();
+    const bool advanceMode = _stricmp(configuredMode.get_ptr(), "advance") == 0;
+    if (advanceMode) sourceItems = filter_leading_lyric_credits(sourceItems);
+
+    std::vector<lyric_schedule_item> schedule;
+    schedule.reserve(sourceItems.size());
+
+    if (!advanceMode) {
+        int groupTime = -1;
+        size_t groupOrder = 0;
+        for (const auto& item : sourceItems) {
+            if (item.time_ms != groupTime) {
+                groupTime = item.time_ms;
+                groupOrder = 0;
+            }
+            schedule.push_back({ item.line_id, item.document_index, item.time_ms,
+                item.time_ms, groupOrder++, item.text });
+        }
+        return schedule;
+    }
+
+    bool havePreviousGroup = false;
+    int previousGroupLyricTime = 0;
+    for (size_t first = 0; first < sourceItems.size();) {
+        size_t last = first + 1;
+        while (last < sourceItems.size() &&
+            sourceItems[last].time_ms == sourceItems[first].time_ms) {
+            ++last;
+        }
+
+        std::wstring groupText;
+        for (size_t index = first; index < last; ++index) {
+            if (!groupText.empty()) groupText += L"\r\n";
+            groupText += sourceItems[index].text;
+        }
+
+        const int lyricTime = sourceItems[first].time_ms;
+        int triggerTime = (std::max)(0, lyricTime - estimate_lyric_speech_ms(groupText));
+        if (havePreviousGroup) {
+            triggerTime = (std::max)(triggerTime, previousGroupLyricTime);
+        }
+
+        size_t sameTimestampOrder = 0;
+        for (size_t index = first; index < last; ++index) {
+            const auto& item = sourceItems[index];
+            schedule.push_back({ item.line_id, item.document_index, item.time_ms,
+                triggerTime, sameTimestampOrder++, item.text });
+        }
+
+        previousGroupLyricTime = lyricTime;
+        havePreviousGroup = true;
+        first = last;
+    }
+
+    std::stable_sort(schedule.begin(), schedule.end(),
+        [](const lyric_schedule_item& first, const lyric_schedule_item& second) {
+            return first.trigger_time_ms < second.trigger_time_ms;
+        });
+    return schedule;
 }
 
 bool jump_to_lyric_time_ms(int time_ms) {
@@ -1692,7 +3085,6 @@ bool jump_to_lyric_time_ms(int time_ms) {
     }
 
     playback->playback_seek(static_cast<double>(time_ms) / 1000.0);
-    g_last_spoken = -1;
     return true;
 }
 

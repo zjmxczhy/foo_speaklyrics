@@ -4,6 +4,9 @@
 struct lrc_line {
     int time_ms = 0;
     std::wstring text;
+    // Assigned in source order and preserved across the stable timestamp sort.
+    // This is the identity used by playback state, not a filtered-vector index.
+    uint64_t line_id = 0;
 };
 
 struct lrc_encoding_info {

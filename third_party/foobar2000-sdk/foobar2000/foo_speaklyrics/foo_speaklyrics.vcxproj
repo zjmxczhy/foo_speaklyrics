@@ -166,6 +166,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="background_task.cpp" />
     <ClCompile Include="config.cpp" />
     <ClCompile Include="initquit.cpp" />
     <ClCompile Include="lrc_parser.cpp" />
@@ -182,6 +183,7 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="playback.cpp" />
+    <ClCompile Include="process_runner.cpp" />
     <ClCompile Include="settings_dialog.cpp" />
     <ClCompile Include="sapi_speech.cpp" />
     <ClCompile Include="speaklyrics_log.cpp" />
@@ -190,19 +192,26 @@
     <ClCompile Include="tolk_bridge.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="background_task.h" />
     <ClInclude Include="config.h" />
+    <ClInclude Include="lrc_download_retry.h" />
     <ClInclude Include="lrc_parser.h" />
+    <ClInclude Include="lyric_scheduler.h" />
     <ClInclude Include="lyrics_copy.h" />
     <ClInclude Include="lyrics_jump_window.h" />
     <ClInclude Include="lyrics_search_window.h" />
     <ClInclude Include="lyrics_timestamp_window.h" />
     <ClInclude Include="playback.h" />
+    <ClInclude Include="process_runner.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="sapi_speech.h" />
     <ClInclude Include="speaklyrics_log.h" />
     <ClInclude Include="speech_engine.h" />
+    <ClInclude Include="speech_task.h" />
+    <ClInclude Include="speech_task_queue.h" />
     <ClInclude Include="stdafx.h" />
     <ClInclude Include="temp_lrc_manifest.h" />
+    <ClInclude Include="tolk_call_policy.h" />
     <ClInclude Include="tolk_bridge.h" />
   </ItemGroup>
   <ItemGroup>
