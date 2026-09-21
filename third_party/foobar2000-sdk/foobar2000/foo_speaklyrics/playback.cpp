@@ -3,6 +3,7 @@
 #include "config.h"
 
 #include "background_task.h"
+#include "filesystem_safety.h"
 #include "process_runner.h"
 
 #include "lrc_download_retry.h"
@@ -99,6 +100,7 @@ std::unordered_set<uint64_t> g_scheduled_line_ids;
 std::unordered_set<uint64_t> g_dispatched_line_ids;
 std::unordered_set<uint64_t> g_skipped_line_ids;
 std::unordered_set<uint64_t> g_retry_line_ids;
+std::unordered_set<std::wstring> g_filesystem_error_log_keys;
 
 struct track_diagnostic_counters {
     uint64_t planned = 0;
@@ -258,6 +260,83 @@ std::wstring command_line_quote(const std::wstring& value) {
 
     return quoted;
 
+}
+
+void log_filesystem_error_once(const wchar_t* source, const wchar_t* operation,
+    const fs::path& path, const std::error_code& error) noexcept {
+    try {
+        const wchar_t* safeSource = source ? source : L"未知来源";
+        const wchar_t* safeOperation = operation ? operation : L"文件系统操作";
+        std::wstring key(safeSource);
+        key.push_back(L'|');
+        key += safeOperation;
+        key.push_back(L'|');
+        key += path.native();
+        key.push_back(L'|');
+        key += std::to_wstring(error.value());
+        if (!g_filesystem_error_log_keys.insert(std::move(key)).second) return;
+
+        speaklyrics_log_warning(
+            L"文件系统访问失败：来源=%s，操作=%s，系统错误码=%d，路径=%s。",
+            safeSource, safeOperation, error.value(), path.c_str());
+    } catch (...) {
+        // A diagnostic failure must never replace the original filesystem failure.
+    }
+}
+
+bool safe_filesystem_exists(const fs::path& path, const wchar_t* source) noexcept {
+    const auto result = speaklyrics_filesystem::exists(path);
+    if (result.error) {
+        log_filesystem_error_once(source, L"检查路径是否存在", path, result.error);
+    }
+    return result.value && !result.error;
+}
+
+bool safe_filesystem_is_directory(const fs::path& path,
+    const wchar_t* source) noexcept {
+    const auto result = speaklyrics_filesystem::is_directory(path);
+    if (result.error) {
+        log_filesystem_error_once(source, L"检查目录", path, result.error);
+    }
+    return result.value && !result.error;
+}
+
+bool safe_filesystem_is_regular_file(const fs::path& path,
+    const wchar_t* source) noexcept {
+    const auto result = speaklyrics_filesystem::is_regular_file(path);
+    if (result.error) {
+        log_filesystem_error_once(source, L"检查普通文件", path, result.error);
+    }
+    return result.value && !result.error;
+}
+
+bool safe_filesystem_open_directory(const fs::path& path, const wchar_t* source,
+    fs::directory_iterator& iterator) noexcept {
+    const std::error_code error =
+        speaklyrics_filesystem::open_directory(path, iterator);
+    if (!error) return true;
+    log_filesystem_error_once(source, L"打开目录进行枚举", path, error);
+    return false;
+}
+
+bool safe_filesystem_increment_directory(fs::directory_iterator& iterator,
+    const fs::path& path, const wchar_t* source) noexcept {
+    const std::error_code error =
+        speaklyrics_filesystem::increment_directory(iterator);
+    if (!error) return true;
+    log_filesystem_error_once(source, L"继续枚举目录", path, error);
+    return false;
+}
+
+void log_filesystem_boundary_failure(const wchar_t* source,
+    const wchar_t* pathText, const std::error_code& error) noexcept {
+    try {
+        log_filesystem_error_once(source, L"歌词查找异常边界",
+            fs::path(pathText ? pathText : L""),
+            error ? error : std::make_error_code(std::errc::io_error));
+    } catch (...) {
+        // The exception boundary itself must remain nonthrowing.
+    }
 }
 
 void parse_candidate_downloader_output(const std::string& output, std::wstring& path, std::wstring& title, std::wstring& artist) {
@@ -546,7 +625,12 @@ std::wstring same_title_candidate_cache_path(const std::wstring& key) {
     clear_same_title_candidate_cache();
     std::error_code error;
     fs::path folder = fs::temp_directory_path(error);
-    if (error || folder.empty()) return std::wstring();
+    if (error) {
+        log_filesystem_error_once(L"同名歌词候选缓存", L"获取系统临时目录",
+            fs::path(), error);
+        return std::wstring();
+    }
+    if (folder.empty()) return std::wstring();
     const size_t keyHash = std::hash<std::wstring>{}(key);
     fs::path path = folder / (L"foo_speaklyrics-candidates-" + std::to_wstring(static_cast<unsigned long long>(keyHash)) + L".json");
     g_same_title_candidate_cache_key = key;
@@ -564,7 +648,8 @@ void maybe_prefetch_same_title_candidates(metadb_handle_ptr track) {
     const std::wstring cachePath = same_title_candidate_cache_path(key);
     const std::wstring sources = cfg_path_wide(cfg_lyric_sources);
     fs::path exePath = fs::path(current_dll_dir()) / L"downloader" / L"LrcDownloader.exe";
-    if (cachePath.empty() || sources.empty() || info.title.empty() || !fs::exists(exePath)) return;
+    if (cachePath.empty() || sources.empty() || info.title.empty() ||
+        !safe_filesystem_exists(exePath, L"同名歌词候选预取下载器")) return;
 
     g_same_title_prefetch_requested_key = key;
     std::wstring command = command_line_quote(exePath.wstring()) +
@@ -599,7 +684,8 @@ void maybe_prefetch_same_title_candidates(metadb_handle_ptr track) {
                 return;
             }
             if (result.status == speaklyrics_process_status::completed &&
-                result.exit_code == 0 && fs::exists(cachePath)) {
+                result.exit_code == 0 && safe_filesystem_exists(
+                    fs::path(cachePath), L"同名歌词候选缓存")) {
                 speaklyrics_log_info(L"同名歌词候选：已完成后台预取。");
             } else {
                 speaklyrics_log_warning(
@@ -810,7 +896,13 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
     fs::create_directories(outputFolder, ec);
 
-    if (ec || !fs::is_directory(outputFolder, ec)) {
+    if (ec) {
+        log_filesystem_error_once(L"自动下载输出目录", L"创建目录",
+            fs::path(outputFolder), ec);
+    }
+
+    if (ec || !safe_filesystem_is_directory(
+        fs::path(outputFolder), L"自动下载输出目录")) {
 
         FB2K_console_formatter() << "foo_speaklyrics: lrc download output folder is not available: " << pfc::stringcvt::string_utf8_from_wide(outputFolder.c_str()).get_ptr();
         mark_lrc_download_preflight_failure(
@@ -824,7 +916,7 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
     fs::path exePath = fs::path(current_dll_dir()) / L"downloader" / L"LrcDownloader.exe";
 
-    if (!fs::exists(exePath, ec)) {
+    if (!safe_filesystem_exists(exePath, L"自动歌词下载器")) {
 
         FB2K_console_formatter() << "foo_speaklyrics: downloader not found: " << pfc::stringcvt::string_utf8_from_wide(exePath.c_str()).get_ptr();
         mark_lrc_download_configuration_unavailable(
@@ -945,7 +1037,8 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
                     key, reason, status, processExitCode, processErrorCode);
                 return;
             }
-            if (downloadedPath.empty() || !fs::exists(downloadedPath)) {
+            if (downloadedPath.empty() || !safe_filesystem_exists(
+                fs::path(downloadedPath), L"自动下载结果")) {
                 mark_lrc_download_transient_failure(
                     key, L"下载器没有返回可验证的最终 LRC 文件",
                     status, processExitCode, processErrorCode);
@@ -1043,9 +1136,15 @@ bool contains_match_text(const std::wstring& haystack, const std::wstring& needl
 
 
 
-std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder, metadb_handle_ptr track, const std::optional<std::wstring>& trackPath, bool allowFuzzyMatch) {
+std::optional<std::wstring> find_lrc_in_folder_impl(const std::wstring& folder,
+    metadb_handle_ptr track, const std::optional<std::wstring>& trackPath,
+    bool allowFuzzyMatch, const wchar_t* source) {
 
-    if (folder.empty() || !fs::is_directory(folder)) return std::nullopt;
+    if (folder.empty()) return std::nullopt;
+
+    const fs::path folderPath(folder);
+
+    if (!safe_filesystem_is_directory(folderPath, source)) return std::nullopt;
 
 
 
@@ -1055,9 +1154,9 @@ std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder, metad
 
         base = fs::path(*trackPath);
 
-        fs::path candidate = fs::path(folder) / (base.stem().wstring() + L".lrc");
+        fs::path candidate = folderPath / (base.stem().wstring() + L".lrc");
 
-        if (fs::exists(candidate)) return candidate.wstring();
+        if (safe_filesystem_exists(candidate, source)) return candidate.wstring();
 
     }
 
@@ -1083,15 +1182,15 @@ std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder, metad
 
             std::wstring name = artistText + L" - " + titleText + L".lrc";
 
-            fs::path candidate = fs::path(folder) / name;
+            fs::path candidate = folderPath / name;
 
-            if (fs::exists(candidate)) return candidate.wstring();
+            if (safe_filesystem_exists(candidate, source)) return candidate.wstring();
 
             name = titleText + L" - " + artistText + L".lrc";
 
-            candidate = fs::path(folder) / name;
+            candidate = folderPath / name;
 
-            if (fs::exists(candidate)) return candidate.wstring();
+            if (safe_filesystem_exists(candidate, source)) return candidate.wstring();
 
         }
 
@@ -1115,59 +1214,55 @@ std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder, metad
 
     size_t bestNameLength = static_cast<size_t>(-1);
 
-    std::error_code ec;
+    fs::directory_iterator current;
 
-    for (const auto& entry : fs::directory_iterator(folder, ec)) {
+    if (!safe_filesystem_open_directory(folderPath, source, current)) {
 
-        if (ec) break;
+        return std::nullopt;
 
-        if (!entry.is_regular_file(ec)) continue;
+    }
 
-        fs::path path = entry.path();
+    const fs::directory_iterator end;
 
-        if (_wcsicmp(path.extension().c_str(), L".lrc") != 0) continue;
+    while (current != end) {
 
+        fs::path path = current->path();
 
+        if (safe_filesystem_is_regular_file(path, source) &&
+            _wcsicmp(path.extension().c_str(), L".lrc") == 0) {
+            std::wstring normalizedName = normalize_match_text(path.stem().wstring());
+            int score = 0;
 
-        std::wstring normalizedName = normalize_match_text(path.stem().wstring());
+            if (!normalizedArtist.empty() && !normalizedTitle.empty()) {
+                // When an artist is known, never reuse another artist's same-title
+                // lyric from a shared folder. This keeps local matching consistent
+                // with downloader matching: title + artist first, title-only only
+                // when the artist is genuinely unavailable.
+                if (contains_match_text(normalizedName, normalizedArtist) &&
+                    contains_match_text(normalizedName, normalizedTitle)) {
+                    score = 4;
+                }
+            } else if (!normalizedTitle.empty() &&
+                contains_match_text(normalizedName, normalizedTitle)) {
+                score = 3;
+            } else if (!normalizedStem.empty() &&
+                contains_match_text(normalizedName, normalizedStem)) {
+                score = 2;
+            } else if (!normalizedName.empty() &&
+                contains_match_text(normalizedStem, normalizedName)) {
+                score = 1;
+            }
 
-        int score = 0;
-
-        if (!normalizedArtist.empty() && !normalizedTitle.empty()) {
-
-            // When an artist is known, never reuse another artist's same-title
-            // lyric from a shared folder. This keeps local matching consistent
-            // with downloader matching: title + artist first, title-only only
-            // when the artist is genuinely unavailable.
-            if (contains_match_text(normalizedName, normalizedArtist) && contains_match_text(normalizedName, normalizedTitle)) score = 4;
-
-        } else if (!normalizedTitle.empty() && contains_match_text(normalizedName, normalizedTitle)) {
-
-            score = 3;
-
-        } else if (!normalizedStem.empty() && contains_match_text(normalizedName, normalizedStem)) {
-
-            score = 2;
-
-        } else if (!normalizedName.empty() && contains_match_text(normalizedStem, normalizedName)) {
-
-            score = 1;
-
+            size_t nameLength = normalizedName.size();
+            if (score > bestScore ||
+                (score == bestScore && score > 0 && nameLength < bestNameLength)) {
+                best = path.wstring();
+                bestScore = score;
+                bestNameLength = nameLength;
+            }
         }
 
-
-
-        size_t nameLength = normalizedName.size();
-
-        if (score > bestScore || (score == bestScore && score > 0 && nameLength < bestNameLength)) {
-
-            best = path.wstring();
-
-            bestScore = score;
-
-            bestNameLength = nameLength;
-
-        }
+        if (!safe_filesystem_increment_directory(current, folderPath, source)) break;
 
     }
 
@@ -1175,6 +1270,27 @@ std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder, metad
 
     return best;
 
+}
+
+std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder,
+    metadb_handle_ptr track, const std::optional<std::wstring>& trackPath,
+    bool allowFuzzyMatch, const wchar_t* source) noexcept {
+    try {
+        return find_lrc_in_folder_impl(
+            folder, track, trackPath, allowFuzzyMatch, source);
+    } catch (const fs::filesystem_error& exception) {
+        log_filesystem_boundary_failure(source, folder.c_str(), exception.code());
+    } catch (const std::bad_alloc&) {
+        log_filesystem_boundary_failure(source, folder.c_str(),
+            std::make_error_code(std::errc::not_enough_memory));
+    } catch (const std::exception&) {
+        log_filesystem_boundary_failure(source, folder.c_str(),
+            std::make_error_code(std::errc::io_error));
+    } catch (...) {
+        log_filesystem_boundary_failure(source, folder.c_str(),
+            std::make_error_code(std::errc::io_error));
+    }
+    return std::nullopt;
 }
 
 struct embedded_lyric_diagnostics {
@@ -1345,11 +1461,13 @@ std::optional<std::wstring> find_embedded_lrc(metadb_handle_ptr track) {
 
 
 
-std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) {
+std::optional<lrc_match> find_lrc_for_track_impl(metadb_handle_ptr track) {
 
     std::wstring manual = cfg_path_wide(cfg_lrc_file);
 
-    if (!manual.empty() && !g_manual_lrc_track_key.empty() && g_manual_lrc_track_key == track_key(track) && fs::exists(manual)) {
+    if (!manual.empty() && !g_manual_lrc_track_key.empty() &&
+        g_manual_lrc_track_key == track_key(track) &&
+        safe_filesystem_exists(fs::path(manual), L"手动加载 LRC")) {
 
         return lrc_match{ manual, false, std::wstring() };
 
@@ -1365,7 +1483,8 @@ std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) {
 
         trackFolder = fs::path(*trackPath).parent_path().wstring();
 
-        if (auto local = find_lrc_in_folder(*trackFolder, track, trackPath, false)) {
+        if (auto local = find_lrc_in_folder(*trackFolder, track, trackPath, false,
+            L"歌曲同目录精确匹配")) {
             return lrc_match{ *local, false, std::wstring() };
         }
 
@@ -1375,7 +1494,8 @@ std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) {
 
     std::wstring folder = cfg_path_wide(cfg_lrc_folder);
 
-    if (auto normal = find_lrc_in_folder(folder, track, trackPath, false)) {
+    if (auto normal = find_lrc_in_folder(folder, track, trackPath, false,
+        L"正式 LRC 目录精确匹配")) {
         return lrc_match{ *normal, false, std::wstring() };
     }
 
@@ -1384,12 +1504,14 @@ std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) {
     }
 
     if (trackFolder) {
-        if (auto local = find_lrc_in_folder(*trackFolder, track, trackPath, true)) {
+        if (auto local = find_lrc_in_folder(*trackFolder, track, trackPath, true,
+            L"歌曲同目录模糊匹配")) {
             return lrc_match{ *local, false, std::wstring() };
         }
     }
 
-    if (auto normal = find_lrc_in_folder(folder, track, trackPath, true)) {
+    if (auto normal = find_lrc_in_folder(folder, track, trackPath, true,
+        L"正式 LRC 目录模糊匹配")) {
         return lrc_match{ *normal, false, std::wstring() };
     }
 
@@ -1397,7 +1519,8 @@ std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) {
 
     std::wstring tempFolder = cfg_path_wide(cfg_temp_lrc_folder);
 
-    if (auto temp = find_lrc_in_folder(tempFolder, track, trackPath, true)) {
+    if (auto temp = find_lrc_in_folder(tempFolder, track, trackPath, true,
+        L"临时 LRC 目录")) {
         return lrc_match{ *temp, true, std::wstring() };
     }
 
@@ -1405,6 +1528,26 @@ std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) {
 
     return std::nullopt;
 
+}
+
+std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) noexcept {
+    try {
+        return find_lrc_for_track_impl(track);
+    } catch (const fs::filesystem_error& exception) {
+        log_filesystem_boundary_failure(L"歌词来源总入口",
+            exception.path1().empty() ? L"" : exception.path1().c_str(),
+            exception.code());
+    } catch (const std::bad_alloc&) {
+        log_filesystem_boundary_failure(L"歌词来源总入口", L"",
+            std::make_error_code(std::errc::not_enough_memory));
+    } catch (const std::exception&) {
+        log_filesystem_boundary_failure(L"歌词来源总入口", L"",
+            std::make_error_code(std::errc::io_error));
+    } catch (...) {
+        log_filesystem_boundary_failure(L"歌词来源总入口", L"",
+            std::make_error_code(std::errc::io_error));
+    }
+    return std::nullopt;
 }
 
 }
@@ -1579,6 +1722,7 @@ void log_track_diagnostic_summary(const wchar_t* reason) {
 
 void reset_track_diagnostic_state() {
     g_track_diagnostics = track_diagnostic_counters{};
+    g_filesystem_error_log_keys.clear();
     g_last_playback_callback_time = -1.0;
     g_pending_announcement_skip_logged = false;
     g_last_skip_document_generation = 0;
@@ -2731,7 +2875,8 @@ bool switch_same_title_lyrics(int direction) {
     std::wstring sources = cfg_path_wide(cfg_lyric_sources);
     std::wstring outputFolder = cfg_path_wide(cfg_temp_lrc_folder);
     fs::path exePath = fs::path(current_dll_dir()) / L"downloader" / L"LrcDownloader.exe";
-    if (info.title.empty() || sources.empty() || outputFolder.empty() || !fs::exists(exePath)) {
+    if (info.title.empty() || sources.empty() || outputFolder.empty() ||
+        !safe_filesystem_exists(exePath, L"同名歌词切换下载器")) {
         g_same_title_switch_in_progress = false;
         speech_queue_speak(L"\u65e0\u6cd5\u5207\u6362\u540c\u540d\u6b4c\u8bcd", true);
         return false;
@@ -2740,6 +2885,8 @@ bool switch_same_title_lyrics(int direction) {
     std::error_code error;
     fs::create_directories(outputFolder, error);
     if (error) {
+        log_filesystem_error_once(L"同名歌词输出目录", L"创建目录",
+            fs::path(outputFolder), error);
         g_same_title_switch_in_progress = false;
         speech_queue_speak(L"\u65e0\u6cd5\u5207\u6362\u540c\u540d\u6b4c\u8bcd", true);
         return false;
@@ -2796,7 +2943,8 @@ bool switch_same_title_lyrics(int direction) {
                 track_key(currentTrack) != requestedTrackKey || g_track_session_id != session) return;
 
             if (status != speaklyrics_process_status::completed || processExitCode != 0 ||
-                path.empty() || !fs::exists(path)) {
+                path.empty() || !safe_filesystem_exists(
+                    fs::path(path), L"同名歌词下载结果")) {
                 g_same_title_candidate_index = previousCandidateIndex;
                 speaklyrics_log_warning(
                     L"同名歌词切换：进程未完成，状态=%s，退出码=%lu，错误码=%lu，序号：%d。",

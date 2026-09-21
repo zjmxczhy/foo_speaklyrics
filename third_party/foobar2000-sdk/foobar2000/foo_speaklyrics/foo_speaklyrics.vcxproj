@@ -170,6 +170,9 @@
     <ClCompile Include="config.cpp" />
     <ClCompile Include="initquit.cpp" />
     <ClCompile Include="lrc_parser.cpp" />
+    <ClCompile Include="lyric_credit_filter.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="lyrics_copy.cpp" />
     <ClCompile Include="lyrics_jump_window.cpp" />
     <ClCompile Include="lyrics_search_window.cpp" />
@@ -194,8 +197,10 @@
   <ItemGroup>
     <ClInclude Include="background_task.h" />
     <ClInclude Include="config.h" />
+    <ClInclude Include="filesystem_safety.h" />
     <ClInclude Include="lrc_download_retry.h" />
     <ClInclude Include="lrc_parser.h" />
+    <ClInclude Include="lyric_credit_filter.h" />
     <ClInclude Include="lyric_scheduler.h" />
     <ClInclude Include="lyrics_copy.h" />
     <ClInclude Include="lyrics_jump_window.h" />
