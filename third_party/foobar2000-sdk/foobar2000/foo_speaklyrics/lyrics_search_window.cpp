@@ -30,6 +30,8 @@ bool g_searching = false;
 uint64_t g_window_generation = 0;
 uint64_t g_search_request_id = 0;
 uint64_t g_download_request_id = 0;
+uint64_t g_manual_candidate_cache_id = 0;
+std::wstring g_manual_candidate_cache_path;
 speaklyrics_background_task_ptr g_search_task;
 speaklyrics_background_task_ptr g_download_task;
 
@@ -38,6 +40,14 @@ struct search_result_item {
     std::wstring artist;
     std::wstring source_key;
     std::wstring source_name;
+    int candidate_index = -1;
+    std::wstring candidate_cache_path;
+    std::wstring query_title;
+    std::wstring query_artist;
+    std::wstring query_album;
+    std::wstring query_sources;
+    int query_duration_seconds = 0;
+    bool query_title_only = false;
     bool placeholder = false;
 };
 
@@ -161,6 +171,21 @@ std::vector<std::wstring> split_tab_line(const std::wstring& line) {
     return parts;
 }
 
+bool parse_nonnegative_index(const std::wstring& value, int& result) {
+    const std::wstring trimmed = trim_text(value);
+    if (trimmed.empty()) return false;
+
+    wchar_t* end = nullptr;
+    const long parsed = wcstol(trimmed.c_str(), &end, 10);
+    if (end == trimmed.c_str() || *end != L'\0' || parsed < 0 ||
+        parsed > static_cast<long>(INT_MAX)) {
+        return false;
+    }
+
+    result = static_cast<int>(parsed);
+    return true;
+}
+
 std::vector<search_result_item> parse_search_output(const std::string& output) {
     std::vector<search_result_item> items;
     std::wstring text = utf8_to_wide_local(output);
@@ -172,10 +197,20 @@ std::vector<search_result_item> parse_search_output(const std::string& output) {
         auto parts = split_tab_line(line);
         if (parts.size() < 3 || trim_text(parts[0]).empty()) continue;
         search_result_item item;
-        item.title = trim_text(parts[0]);
-        item.artist = trim_text(parts[1]);
-        item.source_key = trim_text(parts[2]);
+        int explicitIndex = -1;
+        const bool hasExplicitIndex = parts.size() >= 4 &&
+            parse_nonnegative_index(parts[0], explicitIndex);
+        const size_t titlePart = hasExplicitIndex ? 1 : 0;
+        const size_t artistPart = hasExplicitIndex ? 2 : 1;
+        const size_t sourcePart = hasExplicitIndex ? 3 : 2;
+        if (sourcePart >= parts.size()) continue;
+        item.candidate_index = hasExplicitIndex
+            ? explicitIndex : static_cast<int>(items.size());
+        item.title = trim_text(parts[titlePart]);
+        item.artist = trim_text(parts[artistPart]);
+        item.source_key = trim_text(parts[sourcePart]);
         item.source_name = source_display_name(item.source_key);
+        if (item.title.empty()) continue;
         items.push_back(item);
     }
     return items;
@@ -216,6 +251,53 @@ void set_searching(bool searching) {
     }
 }
 
+void clear_manual_candidate_cache() {
+    if (g_manual_candidate_cache_path.empty()) return;
+
+    std::error_code error;
+    const fs::path path(g_manual_candidate_cache_path);
+    fs::remove(path, error);
+    std::error_code existsError;
+    if (error && fs::exists(path, existsError)) {
+        speaklyrics_log_warning(L"手动搜索：清理旧候选缓存失败：%s，错误码：%lu。",
+            g_manual_candidate_cache_path.c_str(),
+            static_cast<unsigned long>(error.value()));
+    }
+    g_manual_candidate_cache_path.clear();
+}
+
+std::wstring create_manual_candidate_cache() {
+    std::error_code error;
+    const fs::path folder = fs::temp_directory_path(error);
+    if (error || folder.empty()) {
+        speaklyrics_log_error(L"手动搜索：无法获取系统临时目录，不能固定搜索候选。错误码：%lu。",
+            static_cast<unsigned long>(error.value()));
+        return std::wstring();
+    }
+
+    const std::wstring fileName =
+        L"foo_speaklyrics-manual-candidates-" +
+        std::to_wstring(static_cast<unsigned long>(GetCurrentProcessId())) + L"-" +
+        std::to_wstring(static_cast<unsigned long long>(++g_manual_candidate_cache_id)) +
+        L".json";
+    return (folder / fileName).wstring();
+}
+
+void bind_search_context(std::vector<search_result_item>& items,
+    const std::wstring& cachePath, const std::wstring& title,
+    const std::wstring& artist, const std::wstring& album,
+    int durationSeconds, const std::wstring& sources, bool titleOnly) {
+    for (auto& item : items) {
+        item.candidate_cache_path = cachePath;
+        item.query_title = title;
+        item.query_artist = artist;
+        item.query_album = album;
+        item.query_duration_seconds = durationSeconds;
+        item.query_sources = sources;
+        item.query_title_only = titleOnly;
+    }
+}
+
 void cancel_search_background_tasks() {
     if (g_search_task) {
         g_search_task->cancel();
@@ -229,6 +311,7 @@ void cancel_search_background_tasks() {
     ++g_search_request_id;
     ++g_download_request_id;
     g_searching = false;
+    clear_manual_candidate_cache();
 }
 
 bool has_enabled_sources() {
@@ -271,12 +354,24 @@ bool download_item_to_folder(const search_result_item& item, const std::wstring&
         return false;
     }
 
+    const std::wstring queryTitle = item.query_title.empty() ? item.title : item.query_title;
+    const std::wstring queryArtist = item.query_artist.empty() ? item.artist : item.query_artist;
+    const std::wstring queryAlbum = item.query_album;
+    const std::wstring querySources = item.query_sources.empty() ? source : item.query_sources;
     std::wstring cmd = command_line_quote(exe.wstring()) +
-        L" --title " + command_line_quote(item.title) +
-        L" --artist " + command_line_quote(item.artist) +
-        L" --sources " + command_line_quote(source) +
+        L" --title " + command_line_quote(queryTitle) +
+        L" --artist " + command_line_quote(queryArtist) +
+        L" --album " + command_line_quote(queryAlbum) +
+        L" --duration " + std::to_wstring(item.query_duration_seconds) +
+        L" --sources " + command_line_quote(querySources) +
         L" --out " + command_line_quote(folder) +
         L" --search-only";
+    if (item.query_title_only) cmd += L" --title-only";
+    if (item.candidate_index >= 0 && !item.candidate_cache_path.empty()) {
+        cmd += L" --candidate-index " + std::to_wstring(item.candidate_index) +
+            L" --candidate-cache " + command_line_quote(item.candidate_cache_path) +
+            L" --candidate-exact";
+    }
     if (temporary && !manifestPath.empty()) {
         cmd += L" --manifest " + command_line_quote(manifestPath);
     }
@@ -384,11 +479,19 @@ void start_search() {
     std::wstring fallbackArtist = artist.empty() ? current.artist : artist;
     std::wstring sources = cfg_to_wide_local(cfg_lyric_sources);
     fs::path exe = downloader_path();
-    if (!fs::exists(exe)) {
+    std::error_code exeError;
+    if (!fs::is_regular_file(exe, exeError) || exeError) {
         speaklyrics_log_error(L"手动搜索：找不到歌词下载器：%s。", exe.c_str());
         popup_message::g_show("\xE6\x89\xBE\xE4\xB8\x8D\xE5\x88\xB0\xE6\xAD\x8C\xE8\xAF\x8D\xE4\xB8\x8B\xE8\xBD\xBD\xE5\x99\xA8", "\xE6\x90\x9C\xE7\xB4\xA2lrc\xE6\xAD\x8C\xE8\xAF\x8D");
         return;
     }
+    clear_manual_candidate_cache();
+    const std::wstring candidateCachePath = create_manual_candidate_cache();
+    if (candidateCachePath.empty()) {
+        popup_message::g_show("\xE6\x97\xA0\xE6\xB3\x95\xE5\x88\x9B\xE5\xBB\xBA\xE6\x90\x9C\xE7\xB4\xA2\xE5\x80\x99\xE9\x80\x89\xE7\xBC\x93\xE5\xAD\x98", "\xE6\x90\x9C\xE7\xB4\xA2lrc\xE6\xAD\x8C\xE8\xAF\x8D");
+        return;
+    }
+    g_manual_candidate_cache_path = candidateCachePath;
     speaklyrics_log_info(L"手动搜索：开始搜索，标题：%s，艺术家：%s，来源：%s。", title.c_str(), fallbackArtist.c_str(), sources.c_str());
     set_searching(true);
     std::wstring command = command_line_quote(exe.wstring()) +
@@ -396,7 +499,8 @@ void start_search() {
         L" --artist " + command_line_quote(fallbackArtist) +
         L" --album " + command_line_quote(current.album) +
         L" --duration " + std::to_wstring(current.duration_seconds) +
-        L" --sources " + command_line_quote(sources);
+        L" --sources " + command_line_quote(sources) +
+        L" --candidate-cache " + command_line_quote(candidateCachePath);
 
     const std::wstring outputFolder = output_folder_for_download(false);
     const bool temporaryDownload = is_temporary_download(false);
@@ -404,6 +508,7 @@ void start_search() {
     const HWND window = g_window;
     const uint64_t windowGeneration = g_window_generation;
     const uint64_t request = ++g_search_request_id;
+    const std::wstring searchCandidateCachePath = candidateCachePath;
     auto task = speaklyrics_start_background_task(L"manual lyric search");
     if (!task) {
         set_searching(false);
@@ -413,7 +518,9 @@ void start_search() {
     g_search_task = task;
     speaklyrics_run_background_task(task,
         [task, command, exe, title, artist, currentArtist = current.artist,
-            sources, outputFolder, temporaryDownload, manifestPath, window,
+            fallbackArtist, currentAlbum = current.album,
+            currentDuration = current.duration_seconds, sources, outputFolder,
+            temporaryDownload, manifestPath, searchCandidateCachePath, window,
             windowGeneration, request](speaklyrics_background_task& background) {
         const speaklyrics_process_result process = run_process_capture_stdout(
             command, exe.parent_path(), background.aborter(), 30000, 1024 * 1024);
@@ -421,6 +528,8 @@ void start_search() {
         bool autoDownloaded = false;
         if (process.status == speaklyrics_process_status::completed && process.exit_code == 0) {
             items = parse_search_output(process.output);
+            bind_search_context(items, searchCandidateCachePath, title, fallbackArtist,
+                currentAlbum, currentDuration, sources, false);
         }
         if (items.empty()) {
             search_result_item empty;

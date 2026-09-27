@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Web.Script.Serialization;
 using System.Xml;
 
@@ -18,6 +19,8 @@ namespace LrcDownloader
         private const string BaseUrl = "https://lrclib.net";
         private const string BaseUrlQqMusic = "https://u.y.qq.com/cgi-bin/musicu.fcg";
         private const string UserAgent = "foo_speaklyrics-lrcdownloader/0.1 (.NET Framework 4.8)";
+        private const string ManifestMutexName = @"Local\foo_speaklyrics.temp-lrc-manifest.v1";
+        private const long MaxManifestBytes = 1024 * 1024;
 
         private static int Main(string[] args)
         {
@@ -74,9 +77,25 @@ namespace LrcDownloader
 
                 var outputPath = Path.GetFullPath(
                     Path.Combine(options.OutDir, SanitizeFileName(fileName)));
+                var outputExisted = File.Exists(outputPath);
                 WriteAllTextAtomically(outputPath,
                     NormalizeNewlines(StripEnhancedLrcTags(record.SyncedLyrics)));
-                AppendManifest(options.ManifestPath, outputPath);
+                if (!AppendManifest(options.ManifestPath, outputPath))
+                {
+                    if (!outputExisted)
+                    {
+                        try
+                        {
+                            if (File.Exists(outputPath)) File.Delete(outputPath);
+                        }
+                        catch (Exception cleanupError)
+                        {
+                            Console.Error.WriteLine("WARN: untracked temporary lyric cleanup failed: " +
+                                cleanupError.Message);
+                        }
+                    }
+                    throw new IOException("Temporary lyric manifest update failed.");
+                }
 
                 Console.WriteLine(outputPath);
                 Console.WriteLine("SELECTED:\t" + SafeTsv(record.TrackName) + "\t" + SafeTsv(record.ArtistName));
@@ -94,9 +113,11 @@ namespace LrcDownloader
         {
             var query = BuildQueryOptions(options)[0];
             var results = SearchCandidateSources(query);
-            foreach (var item in results)
+            for (var index = 0; index < results.Count; index++)
             {
-                Console.WriteLine(SafeTsv(item.TrackName) + "\t" +
+                var item = results[index];
+                Console.WriteLine(index.ToString(CultureInfo.InvariantCulture) + "\t" +
+                                  SafeTsv(item.TrackName) + "\t" +
                                   SafeTsv(item.ArtistName) + "\t" +
                                   SafeTsv(item.SourceKey));
             }
@@ -354,6 +375,7 @@ namespace LrcDownloader
                 SelfTest = source.SelfTest,
                 TitleOnly = titleOnly,
                 CandidateIndex = source.CandidateIndex,
+                CandidateExact = source.CandidateExact,
                 Help = source.Help
             };
         }
@@ -429,25 +451,63 @@ namespace LrcDownloader
 
         private static LyricsRecord FindLyricsCandidate(Options options, int requestedIndex)
         {
-            var validIndex = 0;
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var candidate in SearchCandidateSources(options))
+            if (requestedIndex < 0) return null;
+
+            // A displayed candidate must be resolved from the exact cache used
+            // by --list. Re-searching here can reorder results and download a
+            // different lyric than the one the user selected.
+            var candidates = TryLoadCandidateCache(options);
+            if (candidates == null || requestedIndex >= candidates.Count)
             {
-                var identity = NormalizeForMatch(candidate.TrackName) + "|" + NormalizeForMatch(candidate.ArtistName);
-                if (!seen.Add(identity)) continue;
-                try
-                {
-                    var resolved = ResolveSearchCandidate(candidate, options);
-                    if (resolved == null || string.IsNullOrWhiteSpace(resolved.SyncedLyrics)) continue;
-                    if (!LyricsHeaderMatchesRequest(resolved.SyncedLyrics, options)) continue;
-                    if (validIndex++ == requestedIndex) return resolved;
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine("WARN: candidate download failed: " + ex.Message);
-                }
+                Console.Error.WriteLine("WARN: candidate cache is missing, expired, invalid, or the index is out of range.");
+                return null;
             }
-            return null;
+
+            if (!options.CandidateExact)
+            {
+                var validIndex = 0;
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var cachedCandidate in candidates)
+                {
+                    var identity = NormalizeForMatch(cachedCandidate.TrackName) + "|" +
+                        NormalizeForMatch(cachedCandidate.ArtistName);
+                    if (!seen.Add(identity)) continue;
+                    try
+                    {
+                        var resolved = ResolveSearchCandidate(cachedCandidate, options);
+                        if (resolved == null || string.IsNullOrWhiteSpace(resolved.SyncedLyrics)) continue;
+                        if (!LyricsHeaderMatchesRequest(resolved.SyncedLyrics, options)) continue;
+                        if (validIndex++ == requestedIndex) return resolved;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine("WARN: candidate download failed: " + ex.Message);
+                    }
+                }
+                return null;
+            }
+
+            var candidate = SelectCachedCandidate(candidates, requestedIndex);
+            if (candidate == null) return null;
+            try
+            {
+                var resolved = ResolveSearchCandidate(candidate, options);
+                if (resolved == null || string.IsNullOrWhiteSpace(resolved.SyncedLyrics)) return null;
+                return LyricsHeaderMatchesRequest(resolved.SyncedLyrics, options) ? resolved : null;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("WARN: selected candidate download failed: " + ex.Message);
+                return null;
+            }
+        }
+
+        private static LyricsRecord SelectCachedCandidate(
+            IList<LyricsRecord> candidates, int requestedIndex)
+        {
+            if (candidates == null || requestedIndex < 0 || requestedIndex >= candidates.Count)
+                return null;
+            return candidates[requestedIndex];
         }
 
         private static LyricsRecord ResolveSearchCandidate(LyricsRecord candidate, Options options)
@@ -1042,10 +1102,47 @@ namespace LrcDownloader
             var switchQueries = BuildQueryOptions(new Options { Title = "情歌", Artist = "梁静茹", TitleOnly = true });
             check(switchQueries.Count > 0 && switchQueries[0].TitleOnly,
                 "same-title candidate switching preserves title-only matching");
+
+            var candidateCachePath = Path.Combine(Path.GetTempPath(),
+                "foo_speaklyrics-candidate-cache-selftest-" + Guid.NewGuid().ToString("N") + ".json");
+            try
+            {
+                var cachedCandidates = new List<LyricsRecord>
+                {
+                    new LyricsRecord { TrackName = "first", ArtistName = "one" },
+                    new LyricsRecord { TrackName = "second", ArtistName = "two" },
+                };
+                var cacheOptions = new Options
+                {
+                    Title = "cache title",
+                    Artist = "cache artist",
+                    CandidateCachePath = candidateCachePath,
+                };
+                SaveCandidateCache(cacheOptions, cachedCandidates);
+                var loadedCandidates = TryLoadCandidateCache(cacheOptions);
+                check(loadedCandidates != null &&
+                    SelectCachedCandidate(loadedCandidates, 1) != null &&
+                    SelectCachedCandidate(loadedCandidates, 1).TrackName == "second",
+                    "candidate index resolves the exact cached record");
+                check(SelectCachedCandidate(loadedCandidates, 2) == null,
+                    "candidate index does not fall back when it is out of range");
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(candidateCachePath)) File.Delete(candidateCachePath);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("WARN: candidate cache self-test cleanup failed: " + ex.Message);
+                }
+            }
             check(!LooksLikeMojibake("你好吗？今天很好。"), "normal Chinese punctuation is not mojibake");
             check(LooksLikeMojibake("姝岃瘝鏃堕棿"), "known GBK mojibake sequence is detected");
 
             failed += RunAtomicWriteSelfTests(check);
+            failed += RunManifestSelfTests(check);
 
             if (failed == 0)
             {
@@ -1125,6 +1222,75 @@ namespace LrcDownloader
             return failed;
         }
 
+        private static int RunManifestSelfTests(Action<bool, string> check)
+        {
+            var failed = 0;
+            var directory = Path.Combine(Path.GetTempPath(),
+                "foo_speaklyrics-manifest-selftest-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(directory);
+                var manifest = Path.Combine(directory, "manifest.txt");
+                var first = Path.Combine(directory, "first.lrc");
+                var second = Path.Combine(directory, "second.lrc");
+                File.WriteAllText(first, "first", new UTF8Encoding(false));
+                File.WriteAllText(second, "second", new UTF8Encoding(false));
+
+                var firstAppend = AppendManifest(manifest, first);
+                var duplicateAppend = AppendManifest(manifest, first);
+                var secondAppend = AppendManifest(manifest, second);
+                var initialLines = File.ReadAllLines(manifest, Encoding.UTF8);
+                var initialOk = firstAppend && duplicateAppend && secondAppend &&
+                    initialLines.Length == 2 &&
+                    string.Equals(initialLines[0], Path.GetFullPath(first), StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(initialLines[1], Path.GetFullPath(second), StringComparison.OrdinalIgnoreCase);
+                check(initialOk, "manifest append is durable and case-insensitively deduplicated");
+                if (!initialOk) failed++;
+
+                var threadFailures = 0;
+                var threads = new List<Thread>();
+                for (var index = 0; index < 6; index++)
+                {
+                    var path = Path.Combine(directory, "parallel-" + index.ToString(CultureInfo.InvariantCulture) + ".lrc");
+                    File.WriteAllText(path, "parallel", new UTF8Encoding(false));
+                    var capturedPath = path;
+                    var thread = new Thread(() =>
+                    {
+                        if (!AppendManifest(manifest, capturedPath))
+                            Interlocked.Increment(ref threadFailures);
+                    });
+                    threads.Add(thread);
+                    thread.Start();
+                }
+                foreach (var thread in threads) thread.Join();
+
+                var parallelLines = File.ReadAllLines(manifest, Encoding.UTF8);
+                var uniqueLines = new HashSet<string>(parallelLines,
+                    StringComparer.OrdinalIgnoreCase);
+                var parallelOk = threadFailures == 0 && parallelLines.Length == 8 &&
+                    uniqueLines.Count == parallelLines.Length;
+                check(parallelOk, "manifest append does not lose concurrent records");
+                if (!parallelOk) failed++;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("FAIL: manifest self-test threw: " + ex.Message);
+                failed++;
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(directory)) Directory.Delete(directory, true);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("WARN: manifest self-test cleanup failed: " + ex.Message);
+                }
+            }
+            return failed;
+        }
+
         private static string HttpGet(string url)
         {
             var request = (HttpWebRequest)WebRequest.Create(url);
@@ -1185,6 +1351,7 @@ namespace LrcDownloader
                 else if (arg == "--duration") options.DurationSeconds = ParseDuration(Next(args, ref i, arg));
                 else if (arg == "--candidate-index") options.CandidateIndex = ParseCandidateIndex(Next(args, ref i, arg));
                 else if (arg == "--candidate-cache") options.CandidateCachePath = Next(args, ref i, arg);
+                else if (arg == "--candidate-exact") options.CandidateExact = true;
                 else if (arg == "--cached-only") options.CachedOnly = true;
                 else if (arg == "--search-only") options.SearchOnly = true;
                 else if (arg == "--title-only") options.TitleOnly = true;
@@ -1311,18 +1478,94 @@ namespace LrcDownloader
             }
         }
 
-        private static void AppendManifest(string manifestPath, string outputPath)
+        private static bool AppendManifest(string manifestPath, string outputPath)
         {
-            if (string.IsNullOrWhiteSpace(manifestPath) || string.IsNullOrWhiteSpace(outputPath)) return;
+            if (string.IsNullOrWhiteSpace(manifestPath) || string.IsNullOrWhiteSpace(outputPath)) return true;
 
+            Mutex mutex = null;
+            var ownsMutex = false;
             try
             {
                 var directory = Path.GetDirectoryName(manifestPath);
                 if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
-                File.AppendAllText(manifestPath, Path.GetFullPath(outputPath) + "\r\n", new UTF8Encoding(false));
+
+                mutex = new Mutex(false, ManifestMutexName);
+                try
+                {
+                    ownsMutex = mutex.WaitOne(TimeSpan.FromSeconds(5));
+                }
+                catch (AbandonedMutexException)
+                {
+                    ownsMutex = true;
+                    Console.Error.WriteLine("WARN: temporary lyric manifest mutex was abandoned; continuing with recovery.");
+                }
+                if (!ownsMutex)
+                {
+                    Console.Error.WriteLine("ERROR: timed out waiting for temporary lyric manifest mutex.");
+                    return false;
+                }
+
+                var fullPath = Path.GetFullPath(outputPath);
+                if (File.Exists(manifestPath) &&
+                    new FileInfo(manifestPath).Length > MaxManifestBytes)
+                {
+                    Console.Error.WriteLine("ERROR: temporary lyric manifest is larger than the safety limit.");
+                    return false;
+                }
+                var existingText = File.Exists(manifestPath)
+                    ? File.ReadAllText(manifestPath, Encoding.UTF8)
+                    : string.Empty;
+                if (Encoding.UTF8.GetByteCount(existingText) > MaxManifestBytes)
+                {
+                    Console.Error.WriteLine("ERROR: temporary lyric manifest is larger than the safety limit.");
+                    return false;
+                }
+
+                var existingLines = existingText.Split(new[] { '\r', '\n' },
+                    StringSplitOptions.RemoveEmptyEntries);
+                foreach (var line in existingLines)
+                {
+                    if (string.Equals(line.Trim(), fullPath, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+
+                var separator = existingText.Length > 0 &&
+                    !existingText.EndsWith("\r", StringComparison.Ordinal) &&
+                    !existingText.EndsWith("\n", StringComparison.Ordinal)
+                    ? "\r\n" : string.Empty;
+                var appendText = separator + fullPath + "\r\n";
+                var appendBytes = new UTF8Encoding(false).GetBytes(appendText);
+                if (Encoding.UTF8.GetByteCount(existingText) + appendBytes.Length > MaxManifestBytes)
+                {
+                    Console.Error.WriteLine("ERROR: temporary lyric manifest would exceed the safety limit.");
+                    return false;
+                }
+
+                using (var stream = new FileStream(manifestPath, FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite, FileShare.Read, 4096, FileOptions.WriteThrough))
+                {
+                    stream.Seek(0, SeekOrigin.End);
+                    stream.Write(appendBytes, 0, appendBytes.Length);
+                    stream.Flush(true);
+                }
+                return true;
             }
-            catch
+            catch (Exception ex)
             {
+                Console.Error.WriteLine("ERROR: temporary lyric manifest append failed: " + ex.Message);
+                return false;
+            }
+            finally
+            {
+                if (ownsMutex && mutex != null)
+                {
+                    try { mutex.ReleaseMutex(); }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine("WARN: temporary lyric manifest mutex release failed: " + ex.Message);
+                    }
+                }
+                if (mutex != null) mutex.Dispose();
             }
         }
 
@@ -1744,8 +1987,9 @@ namespace LrcDownloader
             Console.WriteLine("  --sources     Comma separated lyric sources: lrclib,qq1,qq2,netease. Empty means no online download. qq and 163 are compatibility aliases.");
             Console.WriteLine("  --cached-only Do not call LRCLIB external lookup endpoint.");
             Console.WriteLine("  --search-only Skip exact signature lookup and only use search.");
-            Console.WriteLine("  --candidate-index <n> Download the zero-based matching search candidate.");
-            Console.WriteLine("  --candidate-cache <path> Reuse a short-lived same-title candidate list cache.");
+            Console.WriteLine("  --candidate-index <n> Download the zero-based candidate record.");
+            Console.WriteLine("  --candidate-cache <path> Reuse a short-lived candidate list cache.");
+            Console.WriteLine("  --candidate-exact Resolve exactly the cached record selected by the caller.");
             Console.WriteLine("  --title-only  Match candidates by title without requiring the artist.");
             Console.WriteLine("  --list        Search and print tab-separated results without downloading.");
             Console.WriteLine("  --self-test   Run deterministic matching regression tests.");
@@ -1769,6 +2013,7 @@ namespace LrcDownloader
             public bool SelfTest;
             public bool TitleOnly;
             public int CandidateIndex = -1;
+            public bool CandidateExact;
             public bool Help;
         }
 
