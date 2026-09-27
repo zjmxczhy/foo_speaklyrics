@@ -3,6 +3,7 @@
 #include "config.h"
 
 #include "background_task.h"
+#include "embedded_lyrics_selector.h"
 #include "filesystem_safety.h"
 #include "process_runner.h"
 
@@ -1367,12 +1368,9 @@ std::optional<std::wstring> find_embedded_lrc(metadb_handle_ptr track) {
     const t_size valueCount = info.meta_get_count_by_name("LYRICS");
     if (valueCount == 0) return std::nullopt;
 
-    std::optional<std::wstring> selectedText;
-    size_t selectedIndex = 0;
-    size_t selectedLineCount = 0;
+    std::vector<std::wstring> parsedTexts(static_cast<size_t>(valueCount));
+    std::vector<size_t> parsedLineCounts(static_cast<size_t>(valueCount), 0);
     size_t parseableValueCount = 0;
-    size_t largestValueIndex = 0;
-    size_t largestLineCount = 0;
 
     speaklyrics_log_info(L"标签歌词诊断：歌曲会话=%llu，检测到 LYRICS 值数量=%llu。",
         static_cast<unsigned long long>(g_track_session_id),
@@ -1421,15 +1419,9 @@ std::optional<std::wstring> find_embedded_lrc(metadb_handle_ptr track) {
 
         if (parsed) {
             ++parseableValueCount;
-            if (!selectedText) {
-                selectedText = text;
-                selectedIndex = static_cast<size_t>(index);
-                selectedLineCount = candidate.count();
-            }
-            if (candidate.count() > largestLineCount) {
-                largestLineCount = candidate.count();
-                largestValueIndex = static_cast<size_t>(index);
-            }
+            const size_t valueIndex = static_cast<size_t>(index);
+            parsedLineCounts[valueIndex] = candidate.count();
+            parsedTexts[valueIndex] = std::move(text);
         } else {
             speaklyrics_log_warning(
                 L"标签歌词：LYRICS 的第 %llu 个值不包含可用时间戳，解析信息=%s。",
@@ -1438,25 +1430,35 @@ std::optional<std::wstring> find_embedded_lrc(metadb_handle_ptr track) {
         }
     }
 
-    if (!selectedText) return std::nullopt;
+    const auto selectedValueIndex =
+        speaklyrics_embedded_lyrics::select_best_value_index(parsedLineCounts);
+    if (!selectedValueIndex) return std::nullopt;
+
+    const size_t selectedIndex = *selectedValueIndex;
+    const size_t selectedLineCount = parsedLineCounts[selectedIndex];
+    size_t equalBestValueCount = 0;
+    for (const size_t lineCount : parsedLineCounts) {
+        if (lineCount == selectedLineCount) ++equalBestValueCount;
+    }
 
     speaklyrics_log_info(L"标签歌词诊断：当前选择第 %llu 个 LYRICS 值，有效歌词=%llu行，可解析值总数=%llu。",
         static_cast<unsigned long long>(selectedIndex + 1),
         static_cast<unsigned long long>(selectedLineCount),
         static_cast<unsigned long long>(parseableValueCount));
     if (parseableValueCount > 1) {
-        speaklyrics_log_warning(
-            L"标签歌词诊断：存在 %llu 个可解析的 LYRICS 值，当前只使用第一个可解析值；如果标签按多值分段保存，可能造成歌词缺失。",
-            static_cast<unsigned long long>(parseableValueCount));
-    }
-    if (largestLineCount > selectedLineCount) {
-        speaklyrics_log_warning(
-            L"标签歌词诊断：第 %llu 个值包含 %llu 行，比当前选择的第 %llu 个值多，当前选择可能不是完整歌词。",
-            static_cast<unsigned long long>(largestValueIndex + 1),
-            static_cast<unsigned long long>(largestLineCount),
+        speaklyrics_log_info(
+            L"标签歌词诊断：存在 %llu 个可解析的 LYRICS 值，已选择有效时间歌词行最多的第 %llu 个值；多个值不会自动合并。",
+            static_cast<unsigned long long>(parseableValueCount),
             static_cast<unsigned long long>(selectedIndex + 1));
     }
-    return selectedText;
+    if (equalBestValueCount > 1) {
+        speaklyrics_log_info(
+            L"标签歌词诊断：有 %llu 个值同为最多的 %llu 行，按标签顺序选择最前面的第 %llu 个值。",
+            static_cast<unsigned long long>(equalBestValueCount),
+            static_cast<unsigned long long>(selectedLineCount),
+            static_cast<unsigned long long>(selectedIndex + 1));
+    }
+    return std::move(parsedTexts[selectedIndex]);
 }
 
 

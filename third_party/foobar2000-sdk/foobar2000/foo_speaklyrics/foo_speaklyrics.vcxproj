@@ -197,6 +197,7 @@
   <ItemGroup>
     <ClInclude Include="background_task.h" />
     <ClInclude Include="config.h" />
+    <ClInclude Include="embedded_lyrics_selector.h" />
     <ClInclude Include="filesystem_safety.h" />
     <ClInclude Include="lrc_download_retry.h" />
     <ClInclude Include="lrc_parser.h" />
