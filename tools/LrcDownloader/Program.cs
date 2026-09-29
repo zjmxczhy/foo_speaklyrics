@@ -21,6 +21,7 @@ namespace LrcDownloader
         private const string UserAgent = "foo_speaklyrics-lrcdownloader/0.1 (.NET Framework 4.8)";
         private const string ManifestMutexName = @"Local\foo_speaklyrics.temp-lrc-manifest.v1";
         private const long MaxManifestBytes = 1024 * 1024;
+        private const int CandidateCacheVersion = 2;
 
         private static int Main(string[] args)
         {
@@ -142,7 +143,7 @@ namespace LrcDownloader
             {
                 TryAppendSearchResults(results, () => SearchNeteaseMusic(options), "netease", "\u7F51\u6613\u4E91\u97F3\u4E50", options);
             }
-            results.Sort((left, right) => Score(right, options).CompareTo(Score(left, options)));
+            results.Sort((left, right) => CompareSearchResults(left, right, options));
             return DeduplicateResults(results);
         }
 
@@ -165,7 +166,8 @@ namespace LrcDownloader
                 var cache = serializer.Deserialize<CandidateCache>(File.ReadAllText(options.CandidateCachePath, Encoding.UTF8));
                 if (cache == null || cache.Records == null) return null;
                 if (DateTime.UtcNow.Ticks - cache.CreatedUtcTicks > TimeSpan.FromMinutes(30).Ticks) return null;
-                if (!string.Equals(cache.Title, NormalizeForMatch(options.Title), StringComparison.Ordinal) ||
+                if (cache.Version != CandidateCacheVersion ||
+                    !string.Equals(cache.Title, NormalizeForMatch(options.Title), StringComparison.Ordinal) ||
                     !string.Equals(cache.Artist, options.TitleOnly ? string.Empty : NormalizeForMatch(options.Artist), StringComparison.Ordinal) ||
                     !string.Equals(cache.Album, NormalizeForMatch(options.Album), StringComparison.Ordinal) ||
                     !string.Equals(cache.Sources, NormalizeSources(options.Sources), StringComparison.Ordinal) ||
@@ -187,6 +189,7 @@ namespace LrcDownloader
                 if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
                 var cache = new CandidateCache
                 {
+                    Version = CandidateCacheVersion,
                     Title = NormalizeForMatch(options.Title),
                     Artist = options.TitleOnly ? string.Empty : NormalizeForMatch(options.Artist),
                     Album = NormalizeForMatch(options.Album),
@@ -246,13 +249,79 @@ namespace LrcDownloader
             }
         }
 
+        private static int CompareSearchResults(LyricsRecord left, LyricsRecord right, Options options)
+        {
+            var compare = Score(right, options).CompareTo(Score(left, options));
+            if (compare != 0) return compare;
+
+            compare = StringComparer.OrdinalIgnoreCase.Compare(left.SourceKey, right.SourceKey);
+            if (compare != 0) return compare;
+            compare = StringComparer.OrdinalIgnoreCase.Compare(left.TrackName, right.TrackName);
+            if (compare != 0) return compare;
+            compare = StringComparer.OrdinalIgnoreCase.Compare(left.ArtistName, right.ArtistName);
+            if (compare != 0) return compare;
+            compare = StringComparer.OrdinalIgnoreCase.Compare(left.AlbumName, right.AlbumName);
+            if (compare != 0) return compare;
+            compare = left.DurationSeconds.CompareTo(right.DurationSeconds);
+            if (compare != 0) return compare;
+            return StringComparer.OrdinalIgnoreCase.Compare(
+                CandidateIdentity(left), CandidateIdentity(right));
+        }
+
+        private static string CandidateIdentity(LyricsRecord item)
+        {
+            if (item == null) return "<null>";
+
+            var source = NormalizeIdentityPart(item.SourceKey);
+            if (source.Length == 0) source = NormalizeIdentityPart(item.SourceDisplayName);
+
+            var sourceId = NormalizeIdentityPart(item.SourceId);
+            if (sourceId.Length > 0)
+                return source + "|source-id|" + sourceId;
+
+            if (item.SourceNumericId > 0)
+            {
+                return source + "|source-numeric-id|" +
+                    item.SourceNumericId.ToString(CultureInfo.InvariantCulture);
+            }
+
+            var metadata = string.Join("\u001F", new[]
+            {
+                NormalizeIdentityPart(item.TrackName),
+                NormalizeIdentityPart(item.ArtistName),
+                NormalizeIdentityPart(item.AlbumName),
+                item.DurationSeconds.ToString(CultureInfo.InvariantCulture)
+            });
+
+            if (!string.IsNullOrWhiteSpace(item.SyncedLyrics))
+            {
+                var normalizedLyrics = NormalizeNewlines(item.SyncedLyrics).Trim();
+                using (var sha = SHA256.Create())
+                {
+                    var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(normalizedLyrics));
+                    return source + "|metadata-and-lyrics|" + metadata + "|" +
+                        BitConverter.ToString(hash).Replace("-", string.Empty);
+                }
+            }
+
+            // Without a provider ID or lyric body, retain records whose searchable
+            // metadata differs, while still merging exact duplicate records.
+            return source + "|metadata|" + metadata;
+        }
+
+        private static string NormalizeIdentityPart(string value)
+        {
+            return (value ?? string.Empty).Trim().ToLowerInvariant();
+        }
+
         private static List<LyricsRecord> DeduplicateResults(List<LyricsRecord> input)
         {
             var output = new List<LyricsRecord>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var item in input)
             {
-                var key = NormalizeForMatch(item.TrackName) + "|" + NormalizeForMatch(item.ArtistName) + "|" + item.SourceKey;
+                if (item == null) continue;
+                var key = CandidateIdentity(item);
                 if (seen.Add(key)) output.Add(item);
             }
             return output;
@@ -350,9 +419,14 @@ namespace LrcDownloader
 
             if (string.IsNullOrWhiteSpace(preferredTitle)) preferredTitle = rawTitle;
             var hasArtist = !string.IsNullOrWhiteSpace(preferredArtist);
+            var titleOnly = original.TitleOnly || !hasArtist;
+            // Same-title mode searches by title only. Do not pass the current
+            // artist into provider query APIs, otherwise providers may omit
+            // valid candidates performed by another artist.
+            var queryArtist = titleOnly ? string.Empty : preferredArtist;
             return new List<Options>
             {
-                CloneOptions(original, preferredTitle, hasArtist ? preferredArtist : string.Empty, original.TitleOnly || !hasArtist)
+                CloneOptions(original, preferredTitle, queryArtist, titleOnly)
             };
         }
 
@@ -469,8 +543,7 @@ namespace LrcDownloader
                 var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var cachedCandidate in candidates)
                 {
-                    var identity = NormalizeForMatch(cachedCandidate.TrackName) + "|" +
-                        NormalizeForMatch(cachedCandidate.ArtistName);
+                    var identity = CandidateIdentity(cachedCandidate);
                     if (!seen.Add(identity)) continue;
                     try
                     {
@@ -1100,8 +1173,57 @@ namespace LrcDownloader
                   normalMetadataQueries[0].Artist == "梁静茹" && !normalMetadataQueries[0].TitleOnly,
                 "normal title and artist pair remains the first query");
             var switchQueries = BuildQueryOptions(new Options { Title = "情歌", Artist = "梁静茹", TitleOnly = true });
-            check(switchQueries.Count > 0 && switchQueries[0].TitleOnly,
-                "same-title candidate switching preserves title-only matching");
+            check(switchQueries.Count > 0 && switchQueries[0].TitleOnly &&
+                  string.IsNullOrWhiteSpace(switchQueries[0].Artist),
+                "same-title candidate switching searches by title without restricting artist");
+
+            var candidateVersions = new List<LyricsRecord>
+            {
+                new LyricsRecord
+                {
+                    TrackName = "相思遥", ArtistName = "歌手", SourceKey = "qq1",
+                    SourceId = "song-1", SyncedLyrics = "[00:00.00]版本一"
+                },
+                new LyricsRecord
+                {
+                    TrackName = "相思遥", ArtistName = "歌手", SourceKey = "qq1",
+                    SourceId = "song-1", SyncedLyrics = "[00:00.00]版本二"
+                },
+                new LyricsRecord
+                {
+                    TrackName = "相思遥", ArtistName = "歌手", SourceKey = "lrclib",
+                    SyncedLyrics = "[00:00.00]版本一"
+                },
+                new LyricsRecord
+                {
+                    TrackName = "相思遥", ArtistName = "歌手", SourceKey = "lrclib",
+                    SyncedLyrics = "[00:00.00]版本二"
+                },
+                new LyricsRecord
+                {
+                    TrackName = "相思遥", ArtistName = "歌手", SourceKey = "lrclib",
+                    SyncedLyrics = "[00:00.00]版本一"
+                }
+            };
+            var deduplicatedVersions = DeduplicateResults(candidateVersions);
+            check(deduplicatedVersions.Count == 3,
+                "candidate identity keeps distinct lyric versions and merges exact duplicates");
+
+            var metadataOnlyCandidates = new List<LyricsRecord>
+            {
+                new LyricsRecord
+                {
+                    TrackName = "相思遥", ArtistName = "歌手", AlbumName = "专辑一",
+                    DurationSeconds = 180, SourceKey = "qq1"
+                },
+                new LyricsRecord
+                {
+                    TrackName = "相思遥", ArtistName = "歌手", AlbumName = "专辑二",
+                    DurationSeconds = 181, SourceKey = "qq1"
+                }
+            };
+            check(DeduplicateResults(metadataOnlyCandidates).Count == 2,
+                "candidate identity keeps metadata-distinct records without source IDs");
 
             var candidateCachePath = Path.Combine(Path.GetTempPath(),
                 "foo_speaklyrics-candidate-cache-selftest-" + Guid.NewGuid().ToString("N") + ".json");
@@ -2042,7 +2164,9 @@ namespace LrcDownloader
                     AlbumName = GetString(dict, "albumName"),
                     DurationSeconds = GetInt(dict, "duration"),
                     Instrumental = GetBool(dict, "instrumental"),
-                    SyncedLyrics = GetString(dict, "syncedLyrics")
+                    SyncedLyrics = GetString(dict, "syncedLyrics"),
+                    SourceId = GetString(dict, "id"),
+                    SourceNumericId = GetInt(dict, "id")
                 };
             }
 
@@ -2072,6 +2196,7 @@ namespace LrcDownloader
         private sealed class CandidateCache
         {
             public CandidateCache() { }
+            public int Version;
             public string Title;
             public string Artist;
             public string Album;

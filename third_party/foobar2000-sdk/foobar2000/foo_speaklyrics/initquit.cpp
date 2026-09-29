@@ -4,11 +4,13 @@
 #include "lyrics_search_window.h"
 #include "playback.h"
 #include "speech_engine.h"
+#include "speaklyrics_log.h"
 #include "temp_lrc_manifest.h"
 
 class speaklyrics_initquit : public initquit {
 public:
     void on_init() override {
+        speaklyrics_log_startup();
         temp_lrc_manifest_cleanup();
         write_screen_reader_channel_config_files();
         speech_preload();

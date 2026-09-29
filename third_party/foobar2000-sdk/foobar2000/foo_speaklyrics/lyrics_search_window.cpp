@@ -53,6 +53,10 @@ struct search_result_item {
 
 std::vector<search_result_item> g_items;
 
+bool window_contains_focus(HWND window, HWND focus) {
+    return window && focus && (focus == window || IsChild(window, focus));
+}
+
 void set_accessible_name(HWND wnd, const wchar_t* name) {
     if (!wnd) return;
     SetPropW(wnd, L"Name", reinterpret_cast<HANDLE>(const_cast<wchar_t*>(name)));
@@ -228,18 +232,35 @@ std::wstring display_text(const search_result_item& item) {
     return text;
 }
 
-void refresh_result_list(const std::vector<search_result_item>& items) {
+void refresh_result_list(const std::vector<search_result_item>& items, bool select_first) {
+    const size_t previousCount = g_items.size();
     g_items = items;
     if (!g_list) return;
     SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
     SendMessageW(g_list, LB_RESETCONTENT, 0, 0);
     for (const auto& item : g_items) {
         std::wstring text = display_text(item);
-        SendMessageW(g_list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str()));
+        const LRESULT result = SendMessageW(
+            g_list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str()));
+        if (result == LB_ERR || result == LB_ERRSPACE) {
+            speaklyrics_log_error(
+                L"手动搜索：结果列表添加项目失败，项目序号=%llu，错误码=%lld。",
+                static_cast<unsigned long long>(&item - g_items.data()),
+                static_cast<long long>(result));
+        }
     }
-    SendMessageW(g_list, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
+    if (select_first && !g_items.empty() && !g_items.front().placeholder) {
+        SendMessageW(g_list, LB_SETCURSEL, 0, 0);
+    } else {
+        SendMessageW(g_list, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
+    }
     SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_list, nullptr, TRUE);
+    speaklyrics_log_info(
+        L"手动搜索：结果列表已刷新，旧条目=%llu，新条目=%llu，默认选择=%s。",
+        static_cast<unsigned long long>(previousCount),
+        static_cast<unsigned long long>(g_items.size()),
+        (select_first && !g_items.empty() && !g_items.front().placeholder) ? L"第1项" : L"无");
 }
 
 void set_searching(bool searching) {
@@ -400,8 +421,12 @@ bool should_auto_download(const search_result_item& item, const std::wstring& se
     return false;
 }
 
-void start_download(size_t index, bool permanent) {
-    if (index >= g_items.size() || g_items[index].placeholder) return;
+bool start_download(size_t index, bool permanent) {
+    if (index >= g_items.size() || g_items[index].placeholder) {
+        speaklyrics_log_warning(L"手动搜索下载：没有可下载的候选，项目序号=%llu。",
+            static_cast<unsigned long long>(index));
+        return false;
+    }
     const search_result_item item = g_items[index];
     const std::wstring folder = output_folder_for_download(permanent);
     const bool temporary = is_temporary_download(permanent);
@@ -411,15 +436,25 @@ void start_download(size_t index, bool permanent) {
     const fs::path exe = downloader_path();
     const HWND window = g_window;
     const uint64_t windowGeneration = g_window_generation;
-    const uint64_t request = ++g_download_request_id;
 
     if (g_download_task) {
-        g_download_task->cancel();
-        g_download_task.reset();
+        speaklyrics_log_warning(
+            L"手动搜索下载：已有下载任务正在进行，忽略重复请求；候选序号=%d，标题：%s，艺术家：%s。",
+            item.candidate_index, item.title.c_str(), item.artist.c_str());
+        speech_queue_speak(L"正在下载上一条歌词，请稍候", true);
+        return false;
     }
     auto task = speaklyrics_start_background_task(L"manual lyric download");
-    if (!task) return;
+    if (!task) {
+        speaklyrics_log_warning(L"手动搜索下载：组件正在退出，未启动下载任务。");
+        return false;
+    }
+    const uint64_t request = ++g_download_request_id;
     g_download_task = task;
+    speaklyrics_log_info(
+        L"手动搜索下载：提交候选，候选序号=%d，标题：%s，艺术家：%s，来源：%s，缓存：%s。",
+        item.candidate_index, item.title.c_str(), item.artist.c_str(),
+        item.source_key.c_str(), item.candidate_cache_path.c_str());
     speaklyrics_run_background_task(task,
         [task, item, folder, temporary, source, manifestPath, exe, window,
             windowGeneration, request](speaklyrics_background_task& background) {
@@ -451,6 +486,7 @@ void start_download(size_t index, bool permanent) {
             }
         });
     });
+    return true;
 }
 
 void auto_fill_current_playing() {
@@ -506,6 +542,8 @@ void start_search() {
     const bool temporaryDownload = is_temporary_download(false);
     const std::wstring manifestPath = temporaryDownload ? temp_lrc_manifest_path() : L"";
     const HWND window = g_window;
+    const HWND focusBeforeSearch = GetFocus();
+    const bool focusWasInsideSearchWindow = window_contains_focus(window, focusBeforeSearch);
     const uint64_t windowGeneration = g_window_generation;
     const uint64_t request = ++g_search_request_id;
     const std::wstring searchCandidateCachePath = candidateCachePath;
@@ -521,7 +559,7 @@ void start_search() {
             fallbackArtist, currentAlbum = current.album,
             currentDuration = current.duration_seconds, sources, outputFolder,
             temporaryDownload, manifestPath, searchCandidateCachePath, window,
-            windowGeneration, request](speaklyrics_background_task& background) {
+            focusWasInsideSearchWindow, windowGeneration, request](speaklyrics_background_task& background) {
         const speaklyrics_process_result process = run_process_capture_stdout(
             command, exe.parent_path(), background.aborter(), 30000, 1024 * 1024);
         std::vector<search_result_item> items;
@@ -547,7 +585,8 @@ void start_search() {
         const speaklyrics_process_status status = process.status;
         const DWORD processExitCode = process.exit_code;
         const DWORD processErrorCode = process.error_code;
-        background.post_to_main_thread([task, window, windowGeneration, request,
+        background.post_to_main_thread([task, window, focusWasInsideSearchWindow,
+            windowGeneration, request,
             status, processExitCode, processErrorCode, items = std::move(items),
             autoDownloaded]() mutable {
             if (g_window != window || !IsWindow(window) ||
@@ -562,9 +601,23 @@ void start_search() {
                     L"手动搜索：进程未完成，状态=%s，退出码：%lu，错误码：%lu。",
                     speaklyrics_process_status_name(status), processExitCode, processErrorCode);
             }
-            refresh_result_list(items);
+            const HWND focusBeforeRefresh = GetFocus();
+            const bool focusStillInsideSearchWindow =
+                window_contains_focus(window, focusBeforeRefresh);
+            const bool shouldFocusResults =
+                GetForegroundWindow() == window &&
+                focusWasInsideSearchWindow && focusStillInsideSearchWindow;
+            refresh_result_list(items, true);
             if (autoDownloaded) reload_current_lyrics();
-            if (g_list) SetFocus(g_list);
+            if (shouldFocusResults && g_list) {
+                SetFocus(g_list);
+            } else {
+                speaklyrics_log_info(
+                    L"手动搜索：搜索完成时不移动焦点，窗口前台=%s，原焦点属于搜索窗口=%s，当前焦点属于搜索窗口=%s。",
+                    GetForegroundWindow() == window ? L"是" : L"否",
+                    focusWasInsideSearchWindow ? L"是" : L"否",
+                    focusStillInsideSearchWindow ? L"是" : L"否");
+            }
         });
     });
 }
@@ -580,10 +633,16 @@ void activate_existing_window() {
     if (!focus || !IsChild(g_window, focus)) SetFocus(g_auto_button ? g_auto_button : g_window);
 }
 
-void download_selected(bool permanent) {
+bool download_selected(bool permanent) {
     int sel = g_list ? static_cast<int>(SendMessageW(g_list, LB_GETCURSEL, 0, 0)) : -1;
-    if (sel < 0 || sel >= static_cast<int>(g_items.size())) return;
-    start_download(static_cast<size_t>(sel), permanent);
+    if (sel < 0 || sel >= static_cast<int>(g_items.size())) {
+        speaklyrics_log_warning(L"手动搜索下载：当前没有选中的结果，列表选择=%d，条目数=%llu。",
+            sel, static_cast<unsigned long long>(g_items.size()));
+        return false;
+    }
+    speaklyrics_log_info(L"手动搜索下载：用户请求下载列表第%d项，候选序号=%d。",
+        sel + 1, g_items[static_cast<size_t>(sel)].candidate_index);
+    return start_download(static_cast<size_t>(sel), permanent);
 }
 
 void show_context_menu(POINT pt) {
@@ -596,6 +655,16 @@ void show_context_menu(POINT pt) {
 }
 
 LRESULT CALLBACK list_subclass_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_GETDLGCODE) {
+        LRESULT result = DefSubclassProc(wnd, msg, wp, lp);
+        const MSG* keyMessage = reinterpret_cast<const MSG*>(lp);
+        if (wp == VK_RETURN ||
+            (keyMessage && keyMessage->message == WM_KEYDOWN &&
+                keyMessage->wParam == VK_RETURN)) {
+            result |= DLGC_WANTMESSAGE;
+        }
+        return result;
+    }
     if (msg == WM_KEYDOWN) {
         if (wp == VK_SPACE) {
             if (SendMessageW(g_list, LB_GETCURSEL, 0, 0) == LB_ERR && !g_items.empty()) SendMessageW(g_list, LB_SETCURSEL, 0, 0);
@@ -615,6 +684,7 @@ LRESULT CALLBACK list_subclass_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp, UI
             return 0;
         }
     }
+    if (msg == WM_CHAR && wp == L'\r') return 0;
     return DefSubclassProc(wnd, msg, wp, lp);
 }
 

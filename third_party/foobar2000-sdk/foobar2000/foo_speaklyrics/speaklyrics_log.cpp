@@ -30,6 +30,27 @@ std::wstring fb2k_path_to_native_wide(const char* path) {
     return utf8_to_wide(path);
 }
 
+std::string current_component_version() {
+    const char* currentFileName = core_api::get_my_file_name();
+    if (!currentFileName || !*currentFileName) return std::string();
+
+    componentversion::ptr component;
+    service_enum_t<componentversion> enumeration;
+    pfc::string8 fileName;
+    pfc::string8 version;
+    while (enumeration.next(component)) {
+        fileName = "";
+        component->get_file_name(fileName);
+        if (_stricmp(fileName.get_ptr(), currentFileName) != 0) continue;
+
+        version = "";
+        component->get_component_version(version);
+        return version.get_ptr();
+    }
+
+    return std::string();
+}
+
 std::string wide_to_utf8(const std::wstring& text) {
     return pfc::stringcvt::string_utf8_from_wide(text.c_str()).get_ptr();
 }
@@ -110,6 +131,24 @@ std::wstring speaklyrics_log_file_path() {
     if (!core_api::are_services_available()) return L"";
     pfc::string8 path = core_api::pathInProfile("foo_speaklyrics.log");
     return fb2k_path_to_native_wide(path.get_ptr());
+}
+
+void speaklyrics_log_startup() {
+    static std::atomic_flag startupLogged = ATOMIC_FLAG_INIT;
+    if (speaklyrics_log_file_path().empty()) return;
+    if (startupLogged.test_and_set()) return;
+
+    const std::string version = current_component_version();
+    const std::string architecture = pfc::cpuArch();
+    const std::wstring versionWide = utf8_to_wide(
+        version.empty() ? "unknown" : version.c_str());
+    const std::wstring architectureWide = utf8_to_wide(
+        architecture.empty() ? "unknown" : architecture.c_str());
+
+    speaklyrics_log_info(
+        L"朗读LRC歌词组件启动：版本=%s，架构=%s，进程ID=%lu。",
+        versionWide.c_str(), architectureWide.c_str(),
+        static_cast<unsigned long>(GetCurrentProcessId()));
 }
 
 std::wstring speaklyrics_log_text_excerpt(const wchar_t* text, size_t maximumCharacters) {

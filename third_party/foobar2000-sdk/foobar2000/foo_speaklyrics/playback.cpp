@@ -642,7 +642,6 @@ std::wstring same_title_candidate_cache_path(const std::wstring& key) {
 void maybe_prefetch_same_title_candidates(metadb_handle_ptr track) {
     if (track.is_empty()) return;
     downloader_track_info info = get_downloader_track_info(track);
-    if (!info.artist.empty() && !info.metadata_corrected) return;
 
     const std::wstring key = track_key(track);
     if (key.empty() || g_same_title_prefetch_requested_key == key) return;
@@ -653,13 +652,18 @@ void maybe_prefetch_same_title_candidates(metadb_handle_ptr track) {
         !safe_filesystem_exists(exePath, L"同名歌词候选预取下载器")) return;
 
     g_same_title_prefetch_requested_key = key;
+    // Same-title switching is intentionally title-only. Do not pass the
+    // current artist to the downloader as a query restriction.
     std::wstring command = command_line_quote(exePath.wstring()) +
         L" --title " + command_line_quote(info.title) +
-        L" --artist " + command_line_quote(info.artist) +
         L" --album " + command_line_quote(info.album) +
         L" --duration " + std::to_wstring(info.duration_seconds) +
         L" --sources " + command_line_quote(sources) +
         L" --search-only --title-only --list --candidate-cache " + command_line_quote(cachePath);
+
+    speaklyrics_log_info(
+        L"同名歌词候选：开始按标题预取，标题：%s，当前艺术家：%s；艺术家不作为候选的硬匹配条件。",
+        info.title.c_str(), info.artist.c_str());
 
     auto task = speaklyrics_start_background_task(L"同名歌词候选预取");
     if (!task) {
@@ -2900,7 +2904,6 @@ bool switch_same_title_lyrics(int direction) {
     const std::wstring candidateCachePath = same_title_candidate_cache_path(requestedTrackKey);
     std::wstring command = command_line_quote(exePath.wstring()) +
         L" --title " + command_line_quote(info.title) +
-        L" --artist " + command_line_quote(info.artist) +
         L" --album " + command_line_quote(info.album) +
         L" --duration " + std::to_wstring(info.duration_seconds) +
         L" --sources " + command_line_quote(sources) +
