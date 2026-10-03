@@ -36,7 +36,7 @@ function Build-Tolk($Arch, $VcvarsName) {
     $TolkOut = Join-Path $Root "build\tolk\$Arch"
     New-Item -ItemType Directory -Force -Path $TolkOut | Out-Null
     Write-Host "Building Tolk $Arch..."
-    cmd /c "`"$Vcvars`" && cd /d `"$TolkSrc`" && rc /nologo /fo `"$TolkOut\Tolk.res`" Tolk.rc && cl /nologo /O2 /EHsc /LD /Gw /W4 /D_EXPORTING /DUNICODE /Fe:`"$TolkOut\Tolk.dll`" Tolk.cpp ScreenReaderDriverBOY.cpp ScreenReaderDriverJAWS.cpp ScreenReaderDriverNVDA.cpp ScreenReaderDriverSA.cpp ScreenReaderDriverSNova.cpp ScreenReaderDriverWE.cpp ScreenReaderDriverZDSR.cpp ScreenReaderDriverZT.cpp ScreenReaderDriverSAPI.cpp fsapi.c wineyes.c zt.c `"$TolkOut\Tolk.res`" User32.Lib Ole32.Lib OleAut32.Lib"
+    cmd /c "`"$Vcvars`" && cd /d `"$TolkSrc`" && rc /nologo /fo `"$TolkOut\Tolk.res`" Tolk.rc && cl /nologo /O2 /EHsc /std:c++17 /utf-8 /LD /Gw /W4 /D_EXPORTING /DUNICODE /Fe:`"$TolkOut\Tolk.dll`" Tolk.cpp ScreenReaderDriverBOY.cpp ScreenReaderDriverJAWS.cpp ScreenReaderDriverNVDA.cpp ScreenReaderDriverSA.cpp ScreenReaderDriverSNova.cpp ScreenReaderDriverWE.cpp ScreenReaderDriverZDSR.cpp ScreenReaderDriverZT.cpp ScreenReaderDriverSAPI.cpp fsapi.c wineyes.c zt.c `"$TolkOut\Tolk.res`" User32.Lib Ole32.Lib OleAut32.Lib"
     Assert-NativeExitCode "Tolk $Arch build"
     Use-Patched-Tolk $Arch
 }
@@ -46,9 +46,8 @@ function Use-Patched-Tolk($Arch) {
     $PatchDir = Join-Path $TolkPatchRoot $Arch
     if (-not (Test-Path $PatchDir)) { return }
     $TolkOut = Join-Path $Root "build\tolk\$Arch"
-    $TolkDll = Join-Path $PatchDir "Tolk.dll"
-    if (-not (Test-Path $TolkDll)) { throw "Missing patched Tolk.dll: $TolkDll" }
-    Copy-Item $TolkDll $TolkOut -Force
+    # Keep the Tolk.dll produced from third_party/tolk/src. Only stage the
+    # architecture-specific screen reader support DLLs and configuration.
 
     $TolkLibDir = Join-Path $Root "third_party\tolk\libs\$Arch"
     if (Test-Path $TolkLibDir) {
@@ -84,6 +83,15 @@ function Check-SdkPlatformToolsets() {
     & $CheckScript
 }
 
+function Check-TolkLoadingIsolation() {
+    $CheckScript = Join-Path $Root "tests\check_tolk_loading.ps1"
+    if (-not (Test-Path -LiteralPath $CheckScript -PathType Leaf)) {
+        throw "Missing Tolk DLL loading isolation check script: $CheckScript"
+    }
+    Write-Host "Checking Tolk DLL loading isolation..."
+    & $CheckScript
+}
+
 function Build-Downloader() {
     $Vcvars = Get-Vcvars "vcvars64.bat"
     if (-not (Test-Path $DownloaderProj)) { throw "Missing downloader project: $DownloaderProj" }
@@ -97,6 +105,7 @@ function Build-Downloader() {
 }
 
 Check-SdkPlatformToolsets
+Check-TolkLoadingIsolation
 Ensure-FoobarSharedLibraries
 Build-Downloader
 Build-Tolk "x64" "vcvars64.bat"

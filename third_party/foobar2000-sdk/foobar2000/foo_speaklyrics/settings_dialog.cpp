@@ -18,6 +18,10 @@
 
 
 
+static std::atomic_bool g_foobar_restart_queued{ false };
+
+
+
 
 
 static std::wstring cfg_to_wide(cfg_string& s) {
@@ -852,32 +856,35 @@ static bool confirm_foobar_restart(HWND parent) {
     return result == IDOK;
 }
 
-static bool execute_main_command_direct(const GUID& command) {
-    for (auto item : mainmenu_commands::enumerate()) {
-        const t_uint32 count = item->get_command_count();
-        for (t_uint32 index = 0; index < count; ++index) {
-            if (item->get_command(index) != command) continue;
-            try {
-                item->execute(index, service_ptr_t<service_base>());
-                return true;
-            } catch (...) {
-                return false;
-            }
-        }
-    }
-    return false;
-}
-
 static void queue_foobar_restart() {
-    fb2k::inMainThread([] {
-        speaklyrics_log_info(L"读屏通道设置：用户确认重启 foobar2000。");
-        if (execute_main_command_direct(standard_commands::guid_main_restart)) return;
+    if (g_foobar_restart_queued.exchange(true)) {
+        speaklyrics_log_warning(L"读屏通道设置：重启请求已经排队，忽略重复请求。");
+        return;
+    }
 
-        speaklyrics_log_error(L"读屏通道设置：无法调用 foobar2000 官方重启命令。");
-        pfc::string8 message = pfc::stringcvt::string_utf8_from_wide(
-            L"无法自动重启 foobar2000，请手动退出并重新启动。");
-        pfc::string8 title = pfc::stringcvt::string_utf8_from_wide(L"朗读歌词");
-        popup_message::g_show(message.get_ptr(), title.get_ptr());
+    speaklyrics_log_info(L"读屏通道设置：已安排在设置窗口关闭后重启 foobar2000。");
+    fb2k::inMainThread([] {
+        // Give EndDialog() and the parent settings command a full message-loop
+        // turn to finish before asking the host to unload and restart all
+        // components. The extra hop also avoids executing restart while a
+        // settings dialog callback is still unwinding.
+        fb2k::inMainThread([] {
+            if (core_api::is_shutting_down() || !core_api::are_services_available()) {
+                g_foobar_restart_queued = false;
+                speaklyrics_log_warning(L"读屏通道设置：foobar2000 已经开始退出，取消重复的重启请求。");
+                return;
+            }
+
+            speaklyrics_log_info(L"读屏通道设置：开始调用 foobar2000 官方重启命令。");
+            if (standard_commands::main_restart()) return;
+
+            g_foobar_restart_queued = false;
+            speaklyrics_log_error(L"读屏通道设置：无法调用 foobar2000 官方重启命令。");
+            pfc::string8 message = pfc::stringcvt::string_utf8_from_wide(
+                L"无法自动重启 foobar2000，请手动退出并重新启动。");
+            pfc::string8 title = pfc::stringcvt::string_utf8_from_wide(L"朗读歌词");
+            popup_message::g_show(message.get_ptr(), title.get_ptr());
+        });
     });
 }
 
