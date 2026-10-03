@@ -1,7 +1,8 @@
-﻿#pragma once
+#pragma once
 #include "stdafx.h"
 
 extern cfg_bool cfg_auto_speak;
+extern cfg_bool cfg_detailed_diagnostic_log;
 extern cfg_bool cfg_announce_track_on_change;
 extern cfg_string cfg_announce_track_format;
 extern cfg_int cfg_announce_track_delay_ms;

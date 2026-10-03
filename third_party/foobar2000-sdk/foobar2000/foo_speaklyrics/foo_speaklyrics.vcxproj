@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -201,6 +201,7 @@
     <ClInclude Include="filesystem_safety.h" />
     <ClInclude Include="lrc_download_retry.h" />
     <ClInclude Include="lrc_parser.h" />
+    <ClInclude Include="lyric_candidate_resolver.h" />
     <ClInclude Include="lyric_credit_filter.h" />
     <ClInclude Include="lyric_scheduler.h" />
     <ClInclude Include="lyrics_copy.h" />
@@ -212,6 +213,8 @@
     <ClInclude Include="resource.h" />
     <ClInclude Include="sapi_speech.h" />
     <ClInclude Include="speaklyrics_log.h" />
+    <ClInclude Include="log_file_sink.h" />
+    <ClInclude Include="log_privacy.h" />
     <ClInclude Include="speech_engine.h" />
     <ClInclude Include="speech_task.h" />
     <ClInclude Include="speech_task_queue.h" />

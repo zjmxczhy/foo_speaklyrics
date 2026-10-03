@@ -179,7 +179,7 @@ bool ensure_loaded() {
     // process-wide search-path change with other foobar2000 Tolk components.
     scoped_tolk_load_environment loadEnvironment(tolk_dir);
     if (!loadEnvironment.ready()) {
-        speaklyrics_log_error(L"Tolk：无法设置独立运行库目录：%s。", tolk_dir.c_str());
+        speaklyrics_log_error(L"Tolk：无法设置独立运行库目录：%s。", speaklyrics_log_path(tolk_dir.c_str()).c_str());
         return false;
     }
 
@@ -187,7 +187,7 @@ bool ensure_loaded() {
     if (!path.empty()) path += L"\\Tolk.dll";
     g_tolk = LoadLibraryW(path.c_str());
     if (!g_tolk) {
-        speaklyrics_log_error(L"Tolk：无法加载 Tolk.dll，路径：%s，错误码：%lu。", path.c_str(), GetLastError());
+        speaklyrics_log_error(L"Tolk：无法加载 Tolk.dll，路径：%s，错误码：%lu。", speaklyrics_log_path(path.c_str()).c_str(), GetLastError());
         return false;
     }
 

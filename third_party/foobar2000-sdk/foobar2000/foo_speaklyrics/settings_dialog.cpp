@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 
 #include "config.h"
 
@@ -528,6 +528,8 @@ static const int k_general_page_controls[] = {
     IDC_MISSING_LRC_RETRY_SECONDS,
     IDC_STATIC_LYRIC_VALID_MS,
     IDC_LYRIC_VALID_MS,
+    IDC_DETAILED_DIAGNOSTIC_LOG,
+    IDC_STATIC_DETAILED_DIAGNOSTIC_LOG_NOTE,
 };
 
 static const int k_lyrics_page_controls[] = {
@@ -776,6 +778,8 @@ static void init_dialog(HWND wnd) {
     init_settings_tabs(wnd);
 
     CheckDlgButton(wnd, IDC_AUTO_SPEAK, cfg_auto_speak.get() ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(wnd, IDC_DETAILED_DIAGNOSTIC_LOG,
+        cfg_detailed_diagnostic_log.get() ? BST_CHECKED : BST_UNCHECKED);
 
     CheckDlgButton(wnd, IDC_ANNOUNCE_TRACK, cfg_announce_track_on_change.get() ? BST_CHECKED : BST_UNCHECKED);
     SetWindowTextW(GetDlgItem(wnd, IDC_ANNOUNCE_TRACK), L"\u5207\u6362\u6b4c\u66f2\u65f6\u64ad\u62a5\u6b4c\u66f2\u4fe1\u606f");
@@ -913,6 +917,9 @@ static settings_save_result save_dialog(HWND wnd) {
     int deleteDelayMs = static_cast<int>(GetDlgItemInt(wnd, IDC_TEMP_LRC_DELETE_DELAY_MS, &deleteDelayOk, FALSE));
 
     const bool newAutoSpeak = IsDlgButtonChecked(wnd, IDC_AUTO_SPEAK) == BST_CHECKED;
+    cfg_detailed_diagnostic_log =
+        IsDlgButtonChecked(wnd, IDC_DETAILED_DIAGNOSTIC_LOG) == BST_CHECKED;
+    speaklyrics_log_set_detailed(cfg_detailed_diagnostic_log.get());
     cfg_auto_speak = newAutoSpeak;
     if (oldAutoSpeak && !newAutoSpeak) {
         speech_invalidate_pending(speech_invalidation_reason::auto_speak_disabled);
@@ -1035,6 +1042,8 @@ static INT_PTR CALLBACK dialog_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_AUTO_SPEAK && HIWORD(wp) == BN_CLICKED) {
+            set_dialog_dirty(wnd, true);
+        } else if (LOWORD(wp) == IDC_DETAILED_DIAGNOSTIC_LOG && HIWORD(wp) == BN_CLICKED) {
             set_dialog_dirty(wnd, true);
         } else if (LOWORD(wp) == IDC_ANNOUNCE_TRACK && HIWORD(wp) == BN_CLICKED) {
             set_dialog_dirty(wnd, true);

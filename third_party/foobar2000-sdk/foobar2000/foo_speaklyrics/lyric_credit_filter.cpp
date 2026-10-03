@@ -181,6 +181,30 @@ bool same_header_identity(const std::wstring& first, const std::wstring& second)
     return !normalized_first.empty() && normalized_first == normalized_second;
 }
 
+bool matches_compact_title_artist_header(
+    const std::wstring& raw_text,
+    const lyric_credit_filter_context& context) {
+    const std::wstring title = normalized_credit_line(context.title);
+    const std::wstring artist = normalized_credit_line(context.artist);
+    if (title.empty() || artist.empty()) return false;
+
+    const std::wstring text = normalized_credit_line(raw_text);
+    static const wchar_t separators[] = { L'-', L'\u2013', L'\u2014', L'\uff0d' };
+    for (std::size_t i = 1; i + 1 < text.size(); ++i) {
+        if (std::find(std::begin(separators), std::end(separators), text[i]) == std::end(separators)) continue;
+        if (iswspace(text[i - 1]) && iswspace(text[i + 1])) continue;
+
+        const std::wstring left = normalized_credit_line(text.substr(0, i));
+        const std::wstring right = normalized_credit_line(text.substr(i + 1));
+        // Compact separators also appear in lyrics. Accept only a complete
+        // title/artist pair, with the identities on opposite sides.
+        const bool title_first = left == title && right == artist;
+        const bool artist_first = left == artist && right == title;
+        if (title_first || artist_first) return true;
+    }
+    return false;
+}
+
 bool split_spaced_title_artist_header(const std::wstring& raw_text, std::wstring& left, std::wstring& right) {
     const std::wstring text = normalized_credit_line(raw_text);
     static const wchar_t separators[] = { L'-', L'\u2013', L'\u2014', L'\uff0d' };
@@ -200,6 +224,8 @@ bool looks_like_leading_title_artist_header(
     std::size_t index,
     const lyric_credit_filter_context& context) {
     if (index >= lines.size() || index >= 5) return false;
+
+    if (matches_compact_title_artist_header(lines[index].text, context)) return true;
 
     std::wstring left;
     std::wstring right;

@@ -1,10 +1,23 @@
 #include "stdafx.h"
 #include "speaklyrics_log.h"
+#include "config.h"
+#include "log_file_sink.h"
+#include "log_privacy.h"
 
 namespace {
 
-constexpr ULONGLONG kMaxLogBytes = 8 * 1024 * 1024;
 SRWLOCK g_log_lock = SRWLOCK_INIT;
+speaklyrics_log_io::sink g_log_sink;
+std::atomic<bool> g_detailed_logging{false};
+std::wstring g_log_identity;
+
+class log_lock_guard {
+public:
+    log_lock_guard() { AcquireSRWLockExclusive(&g_log_lock); }
+    ~log_lock_guard() { ReleaseSRWLockExclusive(&g_log_lock); }
+    log_lock_guard(const log_lock_guard&) = delete;
+    log_lock_guard& operator=(const log_lock_guard&) = delete;
+};
 
 std::wstring format_message(const wchar_t* format, va_list args) {
     wchar_t buffer[4096] = {};
@@ -66,43 +79,81 @@ std::wstring current_time_text() {
     return buffer;
 }
 
-void rotate_log_if_needed(const std::wstring& path) {
-    WIN32_FILE_ATTRIBUTE_DATA data = {};
-    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return;
-
-    ULONGLONG size = (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-    if (size < kMaxLogBytes) return;
-
-    std::wstring oldPath = path + L".old";
-    DeleteFileW(oldPath.c_str());
-    MoveFileExW(path.c_str(), oldPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+const wchar_t* io_operation_name(speaklyrics_log_io::operation action) {
+    using speaklyrics_log_io::operation;
+    switch (action) {
+    case operation::inspect: return L"检查文件大小";
+    case operation::rotate: return L"轮转并替换旧日志";
+    case operation::open: return L"打开日志文件";
+    case operation::write: return L"写入日志文件";
+    case operation::close: return L"关闭日志文件";
+    default: return L"未知操作";
+    }
 }
 
-void write_file_line(const std::wstring& line) {
-    std::wstring path = speaklyrics_log_file_path();
-    if (path.empty()) return;
-
-    AcquireSRWLockExclusive(&g_log_lock);
-    rotate_log_if_needed(path);
-
-    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        ReleaseSRWLockExclusive(&g_log_lock);
-        return;
+std::wstring io_notice_line(const speaklyrics_log_io::notice& notice,
+    const std::wstring& path) {
+    using speaklyrics_log_io::notice_kind;
+    std::wstring message = L"日志诊断：";
+    const wchar_t* level = L"INFO";
+    if (notice.kind == notice_kind::failure) {
+        level = L"WARN";
+        message += io_operation_name(notice.action);
+        message += L"失败，系统错误码=" + std::to_wstring(notice.error);
+        message += L"，累计失败=" + std::to_wstring(notice.occurrences);
+        if (notice.action == speaklyrics_log_io::operation::write) {
+            message += L"，预计字节=" + std::to_wstring(notice.expected_bytes);
+            message += L"，已写字节=" + std::to_wstring(notice.actual_bytes);
+        }
+        if (notice.action == speaklyrics_log_io::operation::rotate) {
+            message += L"，当前日志字节=" + std::to_wstring(notice.file_bytes);
+            message += L"；原日志和旧备份均保留，稍后重试轮转";
+        }
+        message += L"。相同错误每30秒最多提示一次。";
+    } else if (notice.kind == notice_kind::recovered) {
+        message += io_operation_name(notice.action);
+        message += L"已恢复，上次系统错误码=" + std::to_wstring(notice.error);
+        message += L"，此前累计失败=" + std::to_wstring(notice.occurrences) + L"。";
+    } else if (notice.kind == notice_kind::rotated) {
+        message += L"已轮转旧日志，旧日志字节=" + std::to_wstring(notice.file_bytes);
+        message += L"，备份=" + speaklyrics_log_path((path + L".old").c_str()) + L"。";
+        message += g_log_identity;
+    } else {
+        message += L"日志写入已恢复，此前未完整写入=" +
+            std::to_wstring(notice.occurrences) + L"条；这些记录无法补回。";
     }
+    message += L" 文件=" + speaklyrics_log_path(path.c_str());
+    return L"[" + current_time_text() + L"] [" + level + L"] " +
+        speaklyrics_log_privacy::message(message, g_detailed_logging.load());
+}
 
-    std::string utf8 = wide_to_utf8(line);
-    utf8 += "\r\n";
-
-    DWORD written = 0;
-    WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
-    CloseHandle(file);
-    ReleaseSRWLockExclusive(&g_log_lock);
+std::vector<std::wstring> write_file_line(const std::wstring& line) {
+    const std::wstring path = speaklyrics_log_file_path();
+    if (path.empty()) return {};
+    const std::string bytes = wide_to_utf8(line) + "\r\n";
+    std::vector<std::wstring> diagnostics;
+    log_lock_guard lock;
+    const uint64_t now = GetTickCount64();
+    auto result = g_log_sink.append(path, bytes, now);
+    std::string diagnosticBytes;
+    for (const auto& notice : result.notices) {
+        diagnostics.push_back(io_notice_line(notice, path));
+        diagnosticBytes += wide_to_utf8(diagnostics.back()) + "\r\n";
+    }
+    // Save transitions when the file is writable. A diagnostic about a failed
+    // diagnostic write goes only to the console, never back into this function.
+    if (result.success && !diagnosticBytes.empty()) {
+        const auto diagnosticResult = g_log_sink.append(path, diagnosticBytes, now);
+        for (const auto& notice : diagnosticResult.notices)
+            diagnostics.push_back(io_notice_line(notice, path));
+    }
+    return diagnostics; // RAII releases the lock before any console callback.
 }
 
 void console_print_safe(const char* text) {
     __try {
-        console::print(text);
+        if (core_api::are_services_available()) console::print(text);
+        else OutputDebugStringA(text);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
@@ -112,17 +163,18 @@ void write_console_line(const std::wstring& line) {
     console_print_safe(utf8.c_str());
 }
 
-void log_v(const wchar_t* level, const wchar_t* format, va_list args) {
-    std::wstring message = format_message(format, args);
-    std::wstring line = L"[";
-    line += current_time_text();
-    line += L"] [";
-    line += level;
-    line += L"] ";
-    line += message;
-
-    write_file_line(line);
-    write_console_line(line);
+void log_v(const wchar_t* level, const wchar_t* format, va_list args) noexcept {
+    try {
+        const std::wstring message = speaklyrics_log_privacy::message(
+            format_message(format, args), g_detailed_logging.load());
+        const std::wstring line = L"[" + current_time_text() + L"] [" + level + L"] " + message;
+        const auto diagnostics = write_file_line(line);
+        for (const auto& diagnostic : diagnostics) write_console_line(diagnostic);
+        write_console_line(line);
+    } catch (...) {
+        // Logging must never throw back into a playback or speech callback.
+        console_print_safe("foo_speaklyrics: could not prepare log record; file logging failed.");
+    }
 }
 
 }
@@ -138,6 +190,7 @@ void speaklyrics_log_startup() {
     if (speaklyrics_log_file_path().empty()) return;
     if (startupLogged.test_and_set()) return;
 
+    g_detailed_logging.store(cfg_detailed_diagnostic_log.get());
     const std::string version = current_component_version();
     const std::string architecture = pfc::cpuArch();
     const std::wstring versionWide = utf8_to_wide(
@@ -145,14 +198,22 @@ void speaklyrics_log_startup() {
     const std::wstring architectureWide = utf8_to_wide(
         architecture.empty() ? "unknown" : architecture.c_str());
 
+    {
+        log_lock_guard lock;
+        g_log_identity = L"组件版本=" + versionWide + L"，架构=" + architectureWide +
+            L"，进程ID=" + std::to_wstring(GetCurrentProcessId()) + L"。";
+    }
     speaklyrics_log_info(
         L"朗读LRC歌词组件启动：版本=%s，架构=%s，进程ID=%lu。",
         versionWide.c_str(), architectureWide.c_str(),
         static_cast<unsigned long>(GetCurrentProcessId()));
+    speaklyrics_log_info(L"日志模式：%s；单个日志约8MiB，旧日志仅保留一份并在下次轮转时替换。",
+        g_detailed_logging.load() ? L"详细诊断（包含完整路径和文本片段）" : L"普通诊断（隐藏目录结构和文本片段）");
 }
 
 std::wstring speaklyrics_log_text_excerpt(const wchar_t* text, size_t maximumCharacters) {
     if (!text || maximumCharacters == 0) return L"";
+    if (!g_detailed_logging.load()) return speaklyrics_log_privacy::private_text(text, false);
 
     std::wstring excerpt;
     excerpt.reserve(maximumCharacters + 3);
@@ -176,18 +237,21 @@ std::wstring speaklyrics_log_text_excerpt(const wchar_t* text, size_t maximumCha
 }
 
 uint64_t speaklyrics_log_text_hash(const wchar_t* text) {
-    constexpr uint64_t offsetBasis = 1469598103934665603ULL;
-    constexpr uint64_t prime = 1099511628211ULL;
-    uint64_t hash = offsetBasis;
-    if (!text) return hash;
-    for (const wchar_t* cursor = text; *cursor; ++cursor) {
-        uint32_t value = static_cast<uint32_t>(*cursor);
-        for (unsigned shift = 0; shift < 32; shift += 8) {
-            hash ^= static_cast<uint8_t>((value >> shift) & 0xff);
-            hash *= prime;
-        }
-    }
-    return hash;
+    return speaklyrics_log_privacy::text_hash(text);
+}
+
+std::wstring speaklyrics_log_path(const wchar_t* path) {
+    return speaklyrics_log_privacy::path_label(path ? path : L"", g_detailed_logging.load());
+}
+
+std::wstring speaklyrics_log_private_text(const wchar_t* text) {
+    return speaklyrics_log_privacy::private_text(text ? text : L"", g_detailed_logging.load());
+}
+
+void speaklyrics_log_set_detailed(bool enabled) {
+    if (g_detailed_logging.exchange(enabled) == enabled) return;
+    speaklyrics_log_info(L"日志模式已切换：%s；仅影响后续记录。",
+        enabled ? L"详细诊断（包含完整路径和文本片段）" : L"普通诊断（隐藏目录结构和文本片段）");
 }
 
 void speaklyrics_log_info(const wchar_t* format, ...) {

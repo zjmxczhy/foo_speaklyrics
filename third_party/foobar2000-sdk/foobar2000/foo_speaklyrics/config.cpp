@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 #include "config.h"
 #include "speech_engine.h"
 #include "speaklyrics_log.h"
@@ -29,6 +29,9 @@ static const GUID guid_cfg_zdsr_channel_name = { 0x11821788, 0x3f1d, 0x4315,{ 0x
 static const GUID guid_cfg_tts_voice_type = { 0x25e6539b, 0x63c8, 0x487b,{ 0x9d, 0x5f, 0x12, 0x4d, 0xde, 0x24, 0xa1, 0x0e } };
 static const GUID guid_cfg_tts_voice_id = { 0xe6ab9ec3, 0x7995, 0x4882,{ 0x82, 0x4c, 0xae, 0x4f, 0x66, 0x9d, 0xc5, 0x92 } };
 static const GUID guid_cfg_tts_rate = { 0xddd95cd8, 0x8cc0, 0x4f15,{ 0xb4, 0x55, 0x92, 0x35, 0x3c, 0x20, 0xfb, 0x69 } };
+
+static const GUID guid_cfg_detailed_diagnostic_log = { 0x32601937, 0x7b5c, 0x4721,{ 0xb5, 0x49, 0x9a, 0xf2, 0x22, 0x79, 0x08, 0x16 } };
+cfg_bool cfg_detailed_diagnostic_log(guid_cfg_detailed_diagnostic_log, false);
 
 cfg_bool cfg_auto_speak(guid_cfg_auto_speak, false);
 cfg_bool cfg_announce_track_on_change(guid_cfg_announce_track_on_change, false);
@@ -129,7 +132,7 @@ bool write_screen_reader_channel_config_files() {
     if (componentDir.empty()) return false;
     std::wstring tolkDir = componentDir + L"\\tolk";
     if (!CreateDirectoryW(tolkDir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        speaklyrics_log_warning(L"\u65e0\u6cd5\u521b\u5efa\u8bfb\u5c4f\u901a\u9053\u914d\u7f6e\u76ee\u5f55\uff1a%s", tolkDir.c_str());
+        speaklyrics_log_warning(L"\u65e0\u6cd5\u521b\u5efa\u8bfb\u5c4f\u901a\u9053\u914d\u7f6e\u76ee\u5f55\uff1a%s", speaklyrics_log_path(tolkDir.c_str()).c_str());
         return false;
     }
 
@@ -166,7 +169,7 @@ bool write_screen_reader_channel_config_files() {
     bool boyOk = write_channel_config_file(tolkDir + L"\\byctrl.conf", boyBytes);
     bool zdsrOk = write_channel_config_file(tolkDir + L"\\ZDSRAPI.ini", zdsrBytes);
     if (!boyOk || !zdsrOk) {
-        speaklyrics_log_warning(L"\u65e0\u6cd5\u5199\u5165\u8bfb\u5c4f\u901a\u9053\u914d\u7f6e\uff1a%s", tolkDir.c_str());
+        speaklyrics_log_warning(L"\u65e0\u6cd5\u5199\u5165\u8bfb\u5c4f\u901a\u9053\u914d\u7f6e\uff1a%s", speaklyrics_log_path(tolkDir.c_str()).c_str());
     }
     return boyOk && zdsrOk;
 }

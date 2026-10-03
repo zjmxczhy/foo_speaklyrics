@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 
 #include "lyrics_search_window.h"
 #include "background_task.h"
@@ -281,7 +281,7 @@ void clear_manual_candidate_cache() {
     std::error_code existsError;
     if (error && fs::exists(path, existsError)) {
         speaklyrics_log_warning(L"手动搜索：清理旧候选缓存失败：%s，错误码：%lu。",
-            g_manual_candidate_cache_path.c_str(),
+            speaklyrics_log_path(g_manual_candidate_cache_path.c_str()).c_str(),
             static_cast<unsigned long>(error.value()));
     }
     g_manual_candidate_cache_path.clear();
@@ -365,13 +365,13 @@ bool download_item_to_folder(const search_result_item& item, const std::wstring&
     fs::create_directories(folder, ec);
     if (ec || !fs::is_directory(folder, ec)) {
         error = L"\u65E0\u6CD5\u4F7F\u7528LRC\u6B4C\u8BCD\u76EE\u5F55";
-        speaklyrics_log_error(L"手动搜索下载：输出目录不可用：%s。", folder.c_str());
+        speaklyrics_log_error(L"手动搜索下载：输出目录不可用：%s。", speaklyrics_log_path(folder.c_str()).c_str());
         return false;
     }
     ec.clear();
     if (!fs::exists(exe, ec) || ec) {
         error = L"\u627E\u4E0D\u5230\u6B4C\u8BCD\u4E0B\u8F7D\u5668";
-        speaklyrics_log_error(L"手动搜索下载：找不到歌词下载器：%s。", exe.c_str());
+        speaklyrics_log_error(L"手动搜索下载：找不到歌词下载器：%s。", speaklyrics_log_path(exe.c_str()).c_str());
         return false;
     }
 
@@ -404,11 +404,11 @@ bool download_item_to_folder(const search_result_item& item, const std::wstring&
         speaklyrics_log_error(
             L"手动搜索下载：进程失败，状态=%s，退出码：%lu，错误码：%lu，标题：%s，艺术家：%s。",
             speaklyrics_process_status_name(process.status), process.exit_code,
-            process.error_code, item.title.c_str(), item.artist.c_str());
+            process.error_code, speaklyrics_log_private_text(item.title.c_str()).c_str(), speaklyrics_log_private_text(item.artist.c_str()).c_str());
         return false;
     }
     speaklyrics_log_info(L"手动搜索下载：下载成功，标题：%s，艺术家：%s，目录：%s。",
-        item.title.c_str(), item.artist.c_str(), folder.c_str());
+        speaklyrics_log_private_text(item.title.c_str()).c_str(), speaklyrics_log_private_text(item.artist.c_str()).c_str(), speaklyrics_log_path(folder.c_str()).c_str());
     return true;
 }
 
@@ -440,7 +440,7 @@ bool start_download(size_t index, bool permanent) {
     if (g_download_task) {
         speaklyrics_log_warning(
             L"手动搜索下载：已有下载任务正在进行，忽略重复请求；候选序号=%d，标题：%s，艺术家：%s。",
-            item.candidate_index, item.title.c_str(), item.artist.c_str());
+            item.candidate_index, speaklyrics_log_private_text(item.title.c_str()).c_str(), speaklyrics_log_private_text(item.artist.c_str()).c_str());
         speech_queue_speak(L"正在下载上一条歌词，请稍候", true);
         return false;
     }
@@ -453,8 +453,8 @@ bool start_download(size_t index, bool permanent) {
     g_download_task = task;
     speaklyrics_log_info(
         L"手动搜索下载：提交候选，候选序号=%d，标题：%s，艺术家：%s，来源：%s，缓存：%s。",
-        item.candidate_index, item.title.c_str(), item.artist.c_str(),
-        item.source_key.c_str(), item.candidate_cache_path.c_str());
+        item.candidate_index, speaklyrics_log_private_text(item.title.c_str()).c_str(), speaklyrics_log_private_text(item.artist.c_str()).c_str(),
+        item.source_key.c_str(), speaklyrics_log_path(item.candidate_cache_path.c_str()).c_str());
     speaklyrics_run_background_task(task,
         [task, item, folder, temporary, source, manifestPath, exe, window,
             windowGeneration, request](speaklyrics_background_task& background) {
@@ -517,7 +517,7 @@ void start_search() {
     fs::path exe = downloader_path();
     std::error_code exeError;
     if (!fs::is_regular_file(exe, exeError) || exeError) {
-        speaklyrics_log_error(L"手动搜索：找不到歌词下载器：%s。", exe.c_str());
+        speaklyrics_log_error(L"手动搜索：找不到歌词下载器：%s。", speaklyrics_log_path(exe.c_str()).c_str());
         popup_message::g_show("\xE6\x89\xBE\xE4\xB8\x8D\xE5\x88\xB0\xE6\xAD\x8C\xE8\xAF\x8D\xE4\xB8\x8B\xE8\xBD\xBD\xE5\x99\xA8", "\xE6\x90\x9C\xE7\xB4\xA2lrc\xE6\xAD\x8C\xE8\xAF\x8D");
         return;
     }
@@ -528,7 +528,7 @@ void start_search() {
         return;
     }
     g_manual_candidate_cache_path = candidateCachePath;
-    speaklyrics_log_info(L"手动搜索：开始搜索，标题：%s，艺术家：%s，来源：%s。", title.c_str(), fallbackArtist.c_str(), sources.c_str());
+    speaklyrics_log_info(L"手动搜索：开始搜索，标题：%s，艺术家：%s，来源：%s。", speaklyrics_log_private_text(title.c_str()).c_str(), speaklyrics_log_private_text(fallbackArtist.c_str()).c_str(), sources.c_str());
     set_searching(true);
     std::wstring command = command_line_quote(exe.wstring()) +
         L" --list --title " + command_line_quote(title) +

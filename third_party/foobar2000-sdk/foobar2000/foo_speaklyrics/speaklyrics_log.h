@@ -7,3 +7,7 @@ void speaklyrics_log_startup();
 std::wstring speaklyrics_log_file_path();
 std::wstring speaklyrics_log_text_excerpt(const wchar_t* text, size_t maximumCharacters = 48);
 uint64_t speaklyrics_log_text_hash(const wchar_t* text);
+
+std::wstring speaklyrics_log_path(const wchar_t* path);
+std::wstring speaklyrics_log_private_text(const wchar_t* text);
+void speaklyrics_log_set_detailed(bool enabled);

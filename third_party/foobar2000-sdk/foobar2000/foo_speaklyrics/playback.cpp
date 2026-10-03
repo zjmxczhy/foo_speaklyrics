@@ -1,4 +1,4 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 
 #include "config.h"
 
@@ -7,6 +7,7 @@
 #include "filesystem_safety.h"
 #include "process_runner.h"
 
+#include "lyric_candidate_resolver.h"
 #include "lrc_download_retry.h"
 #include "lrc_parser.h"
 #include "playback.h"
@@ -153,14 +154,11 @@ void process_speech_task_results();
 
 
 
-struct lrc_match {
-
+struct resolved_lrc {
+    lrc_document document;
+    speaklyrics_lyric_resolver::candidate_source source =
+        speaklyrics_lyric_resolver::candidate_source::manual_file;
     std::wstring path;
-
-    bool temporary;
-
-    std::wstring embedded_text;
-
 };
 
 
@@ -279,7 +277,7 @@ void log_filesystem_error_once(const wchar_t* source, const wchar_t* operation,
 
         speaklyrics_log_warning(
             L"文件系统访问失败：来源=%s，操作=%s，系统错误码=%d，路径=%s。",
-            safeSource, safeOperation, error.value(), path.c_str());
+            safeSource, safeOperation, error.value(), speaklyrics_log_path(path.c_str()).c_str());
     } catch (...) {
         // A diagnostic failure must never replace the original filesystem failure.
     }
@@ -663,7 +661,7 @@ void maybe_prefetch_same_title_candidates(metadb_handle_ptr track) {
 
     speaklyrics_log_info(
         L"同名歌词候选：开始按标题预取，标题：%s，当前艺术家：%s；艺术家不作为候选的硬匹配条件。",
-        info.title.c_str(), info.artist.c_str());
+        speaklyrics_log_private_text(info.title.c_str()).c_str(), speaklyrics_log_private_text(info.artist.c_str()).c_str());
 
     auto task = speaklyrics_start_background_task(L"同名歌词候选预取");
     if (!task) {
@@ -948,7 +946,7 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
     if (info.metadata_corrected) {
         speaklyrics_log_info(
             L"自动下载：已纠正错误标签，原标题：%s，原艺术家：%s，改用标题：%s，艺术家：%s。",
-            info.original_title.c_str(), info.original_artist.c_str(), info.title.c_str(), info.artist.c_str());
+            speaklyrics_log_private_text(info.original_title.c_str()).c_str(), speaklyrics_log_private_text(info.original_artist.c_str()).c_str(), speaklyrics_log_private_text(info.title.c_str()).c_str(), speaklyrics_log_private_text(info.artist.c_str()).c_str());
     }
 
 
@@ -984,7 +982,7 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
     FB2K_console_formatter() << "foo_speaklyrics: started lrc downloader for " << pfc::stringcvt::string_utf8_from_wide(info.title.c_str()).get_ptr();
     speaklyrics_log_info(
         L"自动下载：第%u次尝试开始，标题：%s，艺术家：%s，来源：%s。",
-        attempt, info.title.c_str(), info.artist.c_str(), sources.c_str());
+        attempt, speaklyrics_log_private_text(info.title.c_str()).c_str(), speaklyrics_log_private_text(info.artist.c_str()).c_str(), sources.c_str());
     const uint64_t session = g_track_session_id;
     const bool backgroundStarted = speaklyrics_run_background_task(task,
         [task, command, exePath, key, temporaryDownload, session](speaklyrics_background_task& background) {
@@ -1054,7 +1052,7 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
             pfc::string8 loadError;
             if (!downloadedDocument.load(downloadedPath, loadError)) {
                 speaklyrics_log_error(L"歌词加载：下载的 LRC 解析失败：%s，文件：%s。",
-                    pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr(), downloadedPath.c_str());
+                    pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr(), speaklyrics_log_path(downloadedPath.c_str()).c_str());
                 std::wstring reason = L"下载的 LRC 解析失败：";
                 reason += pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr();
                 mark_lrc_download_transient_failure(
@@ -1079,16 +1077,16 @@ void maybe_start_lrc_downloader(metadb_handle_ptr track) {
 
             g_lrc_download_state.mark_succeeded(key);
             speaklyrics_log_info(L"自动下载：原子写入及歌词加载已验证，最终文件：%s。",
-                downloadedPath.c_str());
+                speaklyrics_log_path(downloadedPath.c_str()).c_str());
             if (successfulAttempt > 1) {
                 speaklyrics_log_info(L"自动下载：网络或下载环境恢复后，第%u次尝试成功。",
                     successfulAttempt);
             }
 
             FB2K_console_formatter() << "foo_speaklyrics: loaded downloaded lrc "
-                << pfc::stringcvt::string_utf8_from_wide(downloadedPath.c_str()).get_ptr();
+                << pfc::stringcvt::string_utf8_from_wide(speaklyrics_log_path(downloadedPath.c_str()).c_str()).get_ptr();
             speaklyrics_log_info(L"歌词加载：已直接加载下载的 LRC：%s，标题：%s，艺术家：%s。",
-                downloadedPath.c_str(), selectedTitle.c_str(), selectedArtist.c_str());
+                speaklyrics_log_path(downloadedPath.c_str()).c_str(), speaklyrics_log_private_text(selectedTitle.c_str()).c_str(), speaklyrics_log_private_text(selectedArtist.c_str()).c_str());
             maybe_prefetch_same_title_candidates(currentTrack);
         });
     });
@@ -1141,15 +1139,23 @@ bool contains_match_text(const std::wstring& haystack, const std::wstring& needl
 
 
 
-std::optional<std::wstring> find_lrc_in_folder_impl(const std::wstring& folder,
+std::vector<std::wstring> find_lrc_candidates_in_folder_impl(const std::wstring& folder,
     metadb_handle_ptr track, const std::optional<std::wstring>& trackPath,
     bool allowFuzzyMatch, const wchar_t* source) {
 
-    if (folder.empty()) return std::nullopt;
+    std::vector<std::wstring> candidates;
+    if (folder.empty()) return candidates;
 
     const fs::path folderPath(folder);
 
-    if (!safe_filesystem_is_directory(folderPath, source)) return std::nullopt;
+    if (!safe_filesystem_is_directory(folderPath, source)) return candidates;
+
+    std::unordered_set<std::wstring> candidateKeys;
+    const auto append_candidate = [&](const fs::path& path) {
+        const std::wstring value = path.wstring();
+        const std::wstring key = speaklyrics_lyric_resolver::path_key(value);
+        if (candidateKeys.insert(key).second) candidates.push_back(value);
+    };
 
 
 
@@ -1161,7 +1167,7 @@ std::optional<std::wstring> find_lrc_in_folder_impl(const std::wstring& folder,
 
         fs::path candidate = folderPath / (base.stem().wstring() + L".lrc");
 
-        if (safe_filesystem_exists(candidate, source)) return candidate.wstring();
+        if (safe_filesystem_exists(candidate, source)) append_candidate(candidate);
 
     }
 
@@ -1189,13 +1195,13 @@ std::optional<std::wstring> find_lrc_in_folder_impl(const std::wstring& folder,
 
             fs::path candidate = folderPath / name;
 
-            if (safe_filesystem_exists(candidate, source)) return candidate.wstring();
+            if (safe_filesystem_exists(candidate, source)) append_candidate(candidate);
 
             name = titleText + L" - " + artistText + L".lrc";
 
             candidate = folderPath / name;
 
-            if (safe_filesystem_exists(candidate, source)) return candidate.wstring();
+            if (safe_filesystem_exists(candidate, source)) append_candidate(candidate);
 
         }
 
@@ -1203,7 +1209,7 @@ std::optional<std::wstring> find_lrc_in_folder_impl(const std::wstring& folder,
 
 
 
-    if (!allowFuzzyMatch) return std::nullopt;
+    if (!allowFuzzyMatch) return candidates;
 
     const std::wstring normalizedStem = trackPath ? normalize_match_text(base.stem().wstring()) : std::wstring();
 
@@ -1213,17 +1219,18 @@ std::optional<std::wstring> find_lrc_in_folder_impl(const std::wstring& folder,
 
 
 
-    std::optional<std::wstring> best;
-
-    int bestScore = 0;
-
-    size_t bestNameLength = static_cast<size_t>(-1);
+    struct ranked_candidate {
+        std::wstring path;
+        int score = 0;
+        size_t name_length = 0;
+    };
+    std::vector<ranked_candidate> rankedCandidates;
 
     fs::directory_iterator current;
 
     if (!safe_filesystem_open_directory(folderPath, source, current)) {
 
-        return std::nullopt;
+        return candidates;
 
     }
 
@@ -1258,12 +1265,13 @@ std::optional<std::wstring> find_lrc_in_folder_impl(const std::wstring& folder,
                 score = 1;
             }
 
-            size_t nameLength = normalizedName.size();
-            if (score > bestScore ||
-                (score == bestScore && score > 0 && nameLength < bestNameLength)) {
-                best = path.wstring();
-                bestScore = score;
-                bestNameLength = nameLength;
+            if (score > 0) {
+                const std::wstring pathValue = path.wstring();
+                const std::wstring key = speaklyrics_lyric_resolver::path_key(pathValue);
+                if (candidateKeys.find(key) == candidateKeys.end()) {
+                    rankedCandidates.push_back(
+                        { pathValue, score, normalizedName.size() });
+                }
             }
         }
 
@@ -1273,15 +1281,27 @@ std::optional<std::wstring> find_lrc_in_folder_impl(const std::wstring& folder,
 
 
 
-    return best;
+    std::stable_sort(rankedCandidates.begin(), rankedCandidates.end(),
+        [](const ranked_candidate& left, const ranked_candidate& right) {
+            if (left.score != right.score) return left.score > right.score;
+            if (left.name_length != right.name_length) {
+                return left.name_length < right.name_length;
+            }
+            return _wcsicmp(left.path.c_str(), right.path.c_str()) < 0;
+        });
+
+    for (const auto& candidate : rankedCandidates) {
+        append_candidate(fs::path(candidate.path));
+    }
+    return candidates;
 
 }
 
-std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder,
+std::vector<std::wstring> find_lrc_candidates_in_folder(const std::wstring& folder,
     metadb_handle_ptr track, const std::optional<std::wstring>& trackPath,
     bool allowFuzzyMatch, const wchar_t* source) noexcept {
     try {
-        return find_lrc_in_folder_impl(
+        return find_lrc_candidates_in_folder_impl(
             folder, track, trackPath, allowFuzzyMatch, source);
     } catch (const fs::filesystem_error& exception) {
         log_filesystem_boundary_failure(source, folder.c_str(), exception.code());
@@ -1295,7 +1315,7 @@ std::optional<std::wstring> find_lrc_in_folder(const std::wstring& folder,
         log_filesystem_boundary_failure(source, folder.c_str(),
             std::make_error_code(std::errc::io_error));
     }
-    return std::nullopt;
+    return {};
 }
 
 struct embedded_lyric_diagnostics {
@@ -1467,90 +1487,171 @@ std::optional<std::wstring> find_embedded_lrc(metadb_handle_ptr track) {
 
 
 
-std::optional<lrc_match> find_lrc_for_track_impl(metadb_handle_ptr track) {
+std::optional<resolved_lrc> resolve_lrc_for_track_impl(
+    metadb_handle_ptr track, const wchar_t* context) {
+    using speaklyrics_lyric_resolver::attempt_status;
+    using speaklyrics_lyric_resolver::candidate_source;
 
-    std::wstring manual = cfg_path_wide(cfg_lrc_file);
+    if (track.is_empty()) return std::nullopt;
 
-    if (!manual.empty() && !g_manual_lrc_track_key.empty() &&
-        g_manual_lrc_track_key == track_key(track) &&
-        safe_filesystem_exists(fs::path(manual), L"手动加载 LRC")) {
-
-        return lrc_match{ manual, false, std::wstring() };
-
-    }
-
-
-
-    auto trackPath = local_track_path(track);
-
+    const std::wstring manual = cfg_path_wide(cfg_lrc_file);
+    const std::wstring currentTrackKey = track_key(track);
+    const auto trackPath = local_track_path(track);
     std::optional<std::wstring> trackFolder;
+    if (trackPath) trackFolder = fs::path(*trackPath).parent_path().wstring();
 
-    if (trackPath) {
+    const std::wstring configuredFolder = cfg_path_wide(cfg_lrc_folder);
+    const std::wstring temporaryFolder = cfg_path_wide(cfg_temp_lrc_folder);
+    std::unordered_set<std::wstring> attemptedPaths;
+    std::optional<resolved_lrc> resolved;
+    size_t rejectedCandidateCount = 0;
 
-        trackFolder = fs::path(*trackPath).parent_path().wstring();
+    const auto try_file_candidate = [&](candidate_source source,
+        const std::wstring& path) -> attempt_status {
+        if (path.empty()) return attempt_status::unavailable;
 
-        if (auto local = find_lrc_in_folder(*trackFolder, track, trackPath, false,
-            L"歌曲同目录精确匹配")) {
-            return lrc_match{ *local, false, std::wstring() };
+        const std::wstring key = speaklyrics_lyric_resolver::path_key(path);
+        if (!attemptedPaths.insert(key).second) {
+            speaklyrics_log_info(
+                L"%s：跳过已经尝试过的重复歌词候选，来源=%s，文件=%s。",
+                context, speaklyrics_lyric_resolver::source_name(source), speaklyrics_log_path(path.c_str()).c_str());
+            return attempt_status::unavailable;
         }
 
-    }
-
-
-
-    std::wstring folder = cfg_path_wide(cfg_lrc_folder);
-
-    if (auto normal = find_lrc_in_folder(folder, track, trackPath, false,
-        L"正式 LRC 目录精确匹配")) {
-        return lrc_match{ *normal, false, std::wstring() };
-    }
-
-    if (auto embedded = find_embedded_lrc(track)) {
-        return lrc_match{ std::wstring(), false, std::move(*embedded) };
-    }
-
-    if (trackFolder) {
-        if (auto local = find_lrc_in_folder(*trackFolder, track, trackPath, true,
-            L"歌曲同目录模糊匹配")) {
-            return lrc_match{ *local, false, std::wstring() };
+        lrc_document candidateDocument;
+        pfc::string8 loadError;
+        if (!candidateDocument.load(path, loadError)) {
+            ++rejectedCandidateCount;
+            speaklyrics_log_warning(
+                L"%s：歌词候选解析失败，来源=%s，错误=%s，文件=%s；继续尝试下一来源。",
+                context, speaklyrics_lyric_resolver::source_name(source),
+                pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr(),
+                speaklyrics_log_path(path.c_str()).c_str());
+            return attempt_status::rejected;
         }
+
+        resolved.emplace();
+        resolved->document = std::move(candidateDocument);
+        resolved->source = source;
+        resolved->path = path;
+        return attempt_status::accepted;
+    };
+
+    const auto try_file_candidates = [&](candidate_source source,
+        const std::vector<std::wstring>& paths) -> attempt_status {
+        return speaklyrics_lyric_resolver::try_candidates_in_order(paths,
+            [&](const std::wstring& path) {
+                return try_file_candidate(source, path);
+            });
+    };
+
+    const auto try_embedded_candidate = [&]() -> attempt_status {
+        auto embedded = find_embedded_lrc(track);
+        if (!embedded) return attempt_status::unavailable;
+
+        lrc_document candidateDocument;
+        pfc::string8 loadError;
+        if (!candidateDocument.load_text(*embedded, L"<LYRICS>", loadError)) {
+            ++rejectedCandidateCount;
+            speaklyrics_log_warning(
+                L"%s：内嵌 LYRICS 候选解析失败，错误=%s；继续尝试下一来源。",
+                context,
+                pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr());
+            return attempt_status::rejected;
+        }
+
+        resolved.emplace();
+        resolved->document = std::move(candidateDocument);
+        resolved->source = candidate_source::embedded_lyrics;
+        resolved->path.clear();
+        return attempt_status::accepted;
+    };
+
+    speaklyrics_lyric_resolver::resolve_in_priority_order(
+        [&](candidate_source source) -> attempt_status {
+            switch (source) {
+            case candidate_source::manual_file:
+                if (!manual.empty() && !g_manual_lrc_track_key.empty() &&
+                    g_manual_lrc_track_key == currentTrackKey &&
+                    safe_filesystem_exists(fs::path(manual),
+                        speaklyrics_lyric_resolver::source_name(source))) {
+                    return try_file_candidate(source, manual);
+                }
+                return attempt_status::unavailable;
+
+            case candidate_source::track_folder_exact:
+                if (trackFolder) {
+                    return try_file_candidates(source,
+                        find_lrc_candidates_in_folder(*trackFolder, track, trackPath, false,
+                            speaklyrics_lyric_resolver::source_name(source)));
+                }
+                return attempt_status::unavailable;
+
+            case candidate_source::configured_folder_exact:
+                return try_file_candidates(source,
+                    find_lrc_candidates_in_folder(configuredFolder, track, trackPath, false,
+                        speaklyrics_lyric_resolver::source_name(source)));
+
+            case candidate_source::embedded_lyrics:
+                return try_embedded_candidate();
+
+            case candidate_source::track_folder_fuzzy:
+                if (trackFolder) {
+                    return try_file_candidates(source,
+                        find_lrc_candidates_in_folder(*trackFolder, track, trackPath, true,
+                            speaklyrics_lyric_resolver::source_name(source)));
+                }
+                return attempt_status::unavailable;
+
+            case candidate_source::configured_folder_fuzzy:
+                return try_file_candidates(source,
+                    find_lrc_candidates_in_folder(configuredFolder, track, trackPath, true,
+                        speaklyrics_lyric_resolver::source_name(source)));
+
+            case candidate_source::temporary_folder:
+                return try_file_candidates(source,
+                    find_lrc_candidates_in_folder(temporaryFolder, track, trackPath, true,
+                        speaklyrics_lyric_resolver::source_name(source)));
+            }
+            return attempt_status::unavailable;
+        });
+
+    if (resolved) {
+        if (rejectedCandidateCount > 0) {
+            speaklyrics_log_info(
+                L"%s：前面有 %llu 个歌词候选解析失败，已回退并加载来源=%s。",
+                context,
+                static_cast<unsigned long long>(rejectedCandidateCount),
+                speaklyrics_lyric_resolver::source_name(resolved->source));
+        }
+        return resolved;
     }
 
-    if (auto normal = find_lrc_in_folder(folder, track, trackPath, true,
-        L"正式 LRC 目录模糊匹配")) {
-        return lrc_match{ *normal, false, std::wstring() };
+    if (rejectedCandidateCount > 0) {
+        speaklyrics_log_warning(
+            L"%s：共 %llu 个歌词候选解析失败，所有本地和标签来源均不可用。",
+            context,
+            static_cast<unsigned long long>(rejectedCandidateCount));
     }
-
-
-
-    std::wstring tempFolder = cfg_path_wide(cfg_temp_lrc_folder);
-
-    if (auto temp = find_lrc_in_folder(tempFolder, track, trackPath, true,
-        L"临时 LRC 目录")) {
-        return lrc_match{ *temp, true, std::wstring() };
-    }
-
-
-
     return std::nullopt;
-
 }
 
-std::optional<lrc_match> find_lrc_for_track(metadb_handle_ptr track) noexcept {
+std::optional<resolved_lrc> resolve_lrc_for_track(
+    metadb_handle_ptr track, const wchar_t* context) noexcept {
     try {
-        return find_lrc_for_track_impl(track);
+        return resolve_lrc_for_track_impl(track, context);
     } catch (const fs::filesystem_error& exception) {
-        log_filesystem_boundary_failure(L"歌词来源总入口",
+        log_filesystem_boundary_failure(L"歌词候选解析总入口",
             exception.path1().empty() ? L"" : exception.path1().c_str(),
             exception.code());
     } catch (const std::bad_alloc&) {
-        log_filesystem_boundary_failure(L"歌词来源总入口", L"",
+        log_filesystem_boundary_failure(L"歌词候选解析总入口", L"",
             std::make_error_code(std::errc::not_enough_memory));
     } catch (const std::exception&) {
-        log_filesystem_boundary_failure(L"歌词来源总入口", L"",
+        log_filesystem_boundary_failure(L"歌词候选解析总入口", L"",
             std::make_error_code(std::errc::io_error));
     } catch (...) {
-        log_filesystem_boundary_failure(L"歌词来源总入口", L"",
+        log_filesystem_boundary_failure(L"歌词候选解析总入口", L"",
             std::make_error_code(std::errc::io_error));
     }
     return std::nullopt;
@@ -1639,7 +1740,7 @@ bool delete_temp_lrc_path(const std::wstring& path) {
 
         if (!ec) {
 
-            FB2K_console_formatter() << "foo_speaklyrics: deleted temporary lrc " << pfc::stringcvt::string_utf8_from_wide(file.c_str()).get_ptr();
+            FB2K_console_formatter() << "foo_speaklyrics: deleted temporary lrc " << pfc::stringcvt::string_utf8_from_wide(speaklyrics_log_path(file.c_str()).c_str()).get_ptr();
 
             return true;
 
@@ -2141,7 +2242,7 @@ void load_for_track(metadb_handle_ptr track, const wchar_t* reason) {
 
     clear_loaded_lrc(reason);
 
-    auto found = find_lrc_for_track(track);
+    auto found = resolve_lrc_for_track(track, L"歌词加载");
 
     if (!found) {
         const std::wstring key = track_key(track);
@@ -2157,49 +2258,30 @@ void load_for_track(metadb_handle_ptr track, const wchar_t* reason) {
 
     }
 
-    pfc::string8 error;
+    const bool embedded = speaklyrics_lyric_resolver::is_embedded(found->source);
+    g_doc = std::move(found->document);
+    g_current_lrc = embedded ? std::wstring() : found->path;
+    g_current_lrc_temporary = speaklyrics_lyric_resolver::is_temporary(found->source);
+    g_loaded_lrc_track_key = track_key(track);
 
-    if (!found->embedded_text.empty()) {
-        if (g_doc.load_text(found->embedded_text, L"<LYRICS>", error)) {
-            g_loaded_lrc_track_key = track_key(track);
-            mark_document_loaded(L"音频文件内嵌 LYRICS 标签");
-            restore_last_spoken_if_same_lyrics(previous, track, L"音频文件内嵌 LYRICS 标签");
-            speaklyrics_log_info(
-                L"歌词加载：已加载音频文件内嵌 LYRICS 标签，共 %llu 行。",
-                static_cast<unsigned long long>(g_doc.count()));
-            maybe_prefetch_same_title_candidates(track);
-        } else {
-            speaklyrics_log_error(
-                L"歌词加载：内嵌 LYRICS 标签解析失败：%s。",
-                pfc::stringcvt::string_wide_from_utf8(error.get_ptr()).get_ptr());
-            maybe_start_lrc_downloader(track);
-        }
-        refresh_lyrics_jump_window();
-        return;
-    }
+    const wchar_t* sourceName = speaklyrics_lyric_resolver::source_name(found->source);
+    mark_document_loaded(sourceName);
+    restore_last_spoken_if_same_lyrics(previous, track, sourceName);
+    if (g_current_lrc_temporary) cancel_pending_temp_lrc_delete(g_current_lrc);
 
-    if (g_doc.load(found->path, error)) {
-
-        g_current_lrc = found->path;
-
-        g_current_lrc_temporary = found->temporary;
-        g_loaded_lrc_track_key = track_key(track);
-        mark_document_loaded(found->temporary ? L"临时歌词目录 LRC" : L"本地或指定目录 LRC");
-        restore_last_spoken_if_same_lyrics(previous, track,
-            found->temporary ? L"临时歌词目录 LRC" : L"本地或指定目录 LRC");
-
-        if (g_current_lrc_temporary) cancel_pending_temp_lrc_delete(g_current_lrc);
-
-        FB2K_console_formatter() << "foo_speaklyrics: loaded " << pfc::stringcvt::string_utf8_from_wide(found->path.c_str()).get_ptr();
-        speaklyrics_log_info(L"歌词加载：已加载 LRC：%s。", found->path.c_str());
-        maybe_prefetch_same_title_candidates(track);
-
+    if (embedded) {
+        speaklyrics_log_info(
+            L"歌词加载：已加载来源=%s，共 %llu 行。",
+            sourceName, static_cast<unsigned long long>(g_doc.count()));
     } else {
-
-        FB2K_console_formatter() << "foo_speaklyrics: " << error;
-        speaklyrics_log_error(L"歌词加载：解析失败：%s，文件：%s。", pfc::stringcvt::string_wide_from_utf8(error.get_ptr()).get_ptr(), found->path.c_str());
-
+        FB2K_console_formatter() << "foo_speaklyrics: loaded "
+            << pfc::stringcvt::string_utf8_from_wide(speaklyrics_log_path(found->path.c_str()).c_str()).get_ptr();
+        speaklyrics_log_info(
+            L"歌词加载：已加载来源=%s，共 %llu 行，文件=%s。",
+            sourceName, static_cast<unsigned long long>(g_doc.count()),
+            speaklyrics_log_path(found->path.c_str()).c_str());
     }
+    maybe_prefetch_same_title_candidates(track);
 
     refresh_lyrics_jump_window();
 
@@ -2618,7 +2700,7 @@ public:
         downloader_track_info trackInfo = get_downloader_track_info(p_track);
         speaklyrics_log_info(L"歌词诊断开始：歌曲会话=%llu，标题=%s，艺术家=%s。",
             static_cast<unsigned long long>(g_track_session_id),
-            trackInfo.title.c_str(), trackInfo.artist.c_str());
+            speaklyrics_log_private_text(trackInfo.title.c_str()).c_str(), speaklyrics_log_private_text(trackInfo.artist.c_str()).c_str());
 
         g_last_missing_lrc_scan_tick = 0;
 
@@ -2749,7 +2831,7 @@ public:
         const std::wstring changedFieldNames = lyric_match_field_names(changedFields);
         speaklyrics_log_info(
             L"标签更新：检测到影响歌词匹配的字段发生变化（%s），重新匹配当前歌曲，标题：%s，艺术家：%s。",
-            changedFieldNames.c_str(), info.title.c_str(), info.artist.c_str());
+            changedFieldNames.c_str(), speaklyrics_log_private_text(info.title.c_str()).c_str(), speaklyrics_log_private_text(info.artist.c_str()).c_str());
         load_for_track(p_track, L"当前歌曲标签更新");
 
     }
@@ -2982,7 +3064,7 @@ bool switch_same_title_lyrics(int direction) {
 
             std::wstring announcement = title.empty() ? requestedTitle : title;
             if (!artist.empty()) announcement += L"\uff0c" + artist;
-            speaklyrics_log_info(L"\u540c\u540d\u6b4c\u8bcd\u5207\u6362\uff1a\u5df2\u52a0\u8f7d\uff0c\u6807\u9898\uff1a%s\uff0c\u827a\u672f\u5bb6\uff1a%s\u3002", announcement.c_str(), artist.c_str());
+            speaklyrics_log_info(L"\u540c\u540d\u6b4c\u8bcd\u5207\u6362\uff1a\u5df2\u52a0\u8f7d\uff0c\u6807\u9898\uff1a%s\uff0c\u827a\u672f\u5bb6\uff1a%s\u3002", speaklyrics_log_private_text(announcement.c_str()).c_str(), speaklyrics_log_private_text(artist.c_str()).c_str());
             speech_queue_speak(announcement.c_str(), true);
         });
     });
@@ -3036,37 +3118,13 @@ ensure_current_lyrics_result ensure_current_lyrics_loaded_for_copy() {
         static_cast<unsigned long long>(g_doc.count()),
         g_loaded_lrc_track_key == currentTrackKey ? L"是" : L"否");
 
-    const auto found = find_lrc_for_track(track);
+    auto found = resolve_lrc_for_track(track, L"复制歌词准备");
     if (!found) {
         maybe_start_lrc_downloader(track);
         const bool downloadPending = lrc_download_in_progress_for(currentTrackKey);
         speaklyrics_log_warning(
             L"复制歌词准备：同步检查未找到可用歌词，后台下载状态=%s。",
             downloadPending ? L"正在进行" : L"未启动");
-        return downloadPending
-            ? ensure_current_lyrics_result::background_download_pending
-            : ensure_current_lyrics_result::unavailable;
-    }
-
-    lrc_document candidateDocument;
-    pfc::string8 loadError;
-    const bool embedded = !found->embedded_text.empty();
-    const bool loaded = embedded
-        ? candidateDocument.load_text(found->embedded_text, L"<LYRICS>", loadError)
-        : candidateDocument.load(found->path, loadError);
-    if (!loaded) {
-        if (embedded) {
-            speaklyrics_log_error(
-                L"复制歌词准备：内嵌 LYRICS 标签解析失败：%s。",
-                pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr());
-        } else {
-            speaklyrics_log_error(
-                L"复制歌词准备：候选 LRC 解析失败：%s，文件：%s。",
-                pfc::stringcvt::string_wide_from_utf8(loadError.get_ptr()).get_ptr(),
-                found->path.c_str());
-        }
-        maybe_start_lrc_downloader(track);
-        const bool downloadPending = lrc_download_in_progress_for(currentTrackKey);
         return downloadPending
             ? ensure_current_lyrics_result::background_download_pending
             : ensure_current_lyrics_result::unavailable;
@@ -3079,28 +3137,28 @@ ensure_current_lyrics_result ensure_current_lyrics_loaded_for_copy() {
     }
 
     schedule_current_temp_lrc_delete();
-    g_doc = std::move(candidateDocument);
+    const bool embedded = speaklyrics_lyric_resolver::is_embedded(found->source);
+    g_doc = std::move(found->document);
     g_current_lrc = embedded ? std::wstring() : found->path;
-    g_current_lrc_temporary = !embedded && found->temporary;
+    g_current_lrc_temporary = speaklyrics_lyric_resolver::is_temporary(found->source);
     g_loaded_lrc_track_key = currentTrackKey;
 
-    const wchar_t* source = embedded
-        ? L"复制前刷新：音频文件内嵌 LYRICS 标签"
-        : (found->temporary
-            ? L"复制前刷新：临时歌词目录 LRC"
-            : L"复制前刷新：本地或指定目录 LRC");
-    mark_document_loaded(source);
+    const std::wstring source = std::wstring(L"复制前刷新：") +
+        speaklyrics_lyric_resolver::source_name(found->source);
+    mark_document_loaded(source.c_str());
     if (g_current_lrc_temporary) cancel_pending_temp_lrc_delete(g_current_lrc);
     refresh_lyrics_jump_window();
 
     if (embedded) {
         speaklyrics_log_info(
-            L"复制歌词准备：已同步加载当前歌曲的内嵌 LYRICS 标签，共 %llu 行。",
+            L"复制歌词准备：已同步加载来源=%s，共 %llu 行。",
+            speaklyrics_lyric_resolver::source_name(found->source),
             static_cast<unsigned long long>(g_doc.count()));
     } else {
         speaklyrics_log_info(
-            L"复制歌词准备：已同步加载当前歌曲的 LRC，共 %llu 行，文件：%s。",
-            static_cast<unsigned long long>(g_doc.count()), g_current_lrc.c_str());
+            L"复制歌词准备：已同步加载来源=%s，共 %llu 行，文件=%s。",
+            speaklyrics_lyric_resolver::source_name(found->source),
+            static_cast<unsigned long long>(g_doc.count()), speaklyrics_log_path(g_current_lrc.c_str()).c_str());
     }
     return ensure_current_lyrics_result::loaded;
 }

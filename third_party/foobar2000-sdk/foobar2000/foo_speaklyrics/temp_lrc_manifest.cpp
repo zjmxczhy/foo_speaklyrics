@@ -297,20 +297,20 @@ void temp_lrc_manifest_cleanup() {
                 retained.push_back(path);
                 speaklyrics_log_warning(
                     L"Temporary lyric cleanup preserved a manifest entry that could not be classified: %s.",
-                    path.c_str());
+                    speaklyrics_log_path(path.c_str()).c_str());
                 continue;
             }
             if (safety == manifest_path_safety::unsafe) {
                 speaklyrics_log_warning(
                     L"Temporary lyric cleanup removed an unsafe manifest entry without deleting it: %s.",
-                    path.c_str());
+                    speaklyrics_log_path(path.c_str()).c_str());
                 continue;
             }
             if (safety == manifest_path_safety::unresolved) {
                 retained.push_back(path);
                 speaklyrics_log_warning(
                     L"Temporary lyric cleanup preserved an unresolved manifest entry: %s.",
-                    path.c_str());
+                    speaklyrics_log_path(path.c_str()).c_str());
                 continue;
             }
 
@@ -319,25 +319,25 @@ void temp_lrc_manifest_cleanup() {
             if (state == manifest_file_state::missing) {
                 speaklyrics_log_info(
                     L"Temporary lyric cleanup removed an already missing entry: %s.",
-                    path.c_str());
+                    speaklyrics_log_path(path.c_str()).c_str());
                 continue;
             }
             if (state == manifest_file_state::invalid) {
                 speaklyrics_log_warning(
                     L"Temporary lyric cleanup removed a directory entry without deleting it: %s.",
-                    path.c_str());
+                    speaklyrics_log_path(path.c_str()).c_str());
                 continue;
             }
             if (state == manifest_file_state::unresolved) {
                 retained.push_back(path);
                 speaklyrics_log_warning(
                     L"Temporary lyric cleanup preserved an inaccessible entry: %s, error code=%lu.",
-                    path.c_str(), static_cast<unsigned long>(error));
+                    speaklyrics_log_path(path.c_str()).c_str(), static_cast<unsigned long>(error));
                 continue;
             }
 
             if (DeleteFileW(path.c_str())) {
-                speaklyrics_log_info(L"Temporary lyric cleanup deleted: %s.", path.c_str());
+                speaklyrics_log_info(L"Temporary lyric cleanup deleted: %s.", speaklyrics_log_path(path.c_str()).c_str());
             } else {
                 error = GetLastError();
                 if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
@@ -346,7 +346,7 @@ void temp_lrc_manifest_cleanup() {
                 retained.push_back(path);
                 speaklyrics_log_warning(
                     L"Temporary lyric cleanup could not delete %s; retained for the next startup, error code=%lu.",
-                    path.c_str(), static_cast<unsigned long>(error));
+                    speaklyrics_log_path(path.c_str()).c_str(), static_cast<unsigned long>(error));
             }
         }
 

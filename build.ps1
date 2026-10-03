@@ -75,6 +75,15 @@ function Build-Component($Platform, $VcvarsName) {
     Assert-NativeExitCode "foo_speaklyrics $Platform build"
 }
 
+function Check-SdkPlatformToolsets() {
+    $CheckScript = Join-Path $Root "tests\check_platform_toolset.ps1"
+    if (-not (Test-Path -LiteralPath $CheckScript -PathType Leaf)) {
+        throw "Missing SDK PlatformToolset check script: $CheckScript"
+    }
+    Write-Host "Checking SDK PlatformToolset configuration..."
+    & $CheckScript
+}
+
 function Build-Downloader() {
     $Vcvars = Get-Vcvars "vcvars64.bat"
     if (-not (Test-Path $DownloaderProj)) { throw "Missing downloader project: $DownloaderProj" }
@@ -87,6 +96,7 @@ function Build-Downloader() {
     Assert-NativeExitCode "LrcDownloader self-test"
 }
 
+Check-SdkPlatformToolsets
 Ensure-FoobarSharedLibraries
 Build-Downloader
 Build-Tolk "x64" "vcvars64.bat"
