@@ -90,3 +90,19 @@ foobar2000 朗读 LRC 歌词组件。
 ## 许可证
 
 许可证信息见 [LICENSE](LICENSE)。
+
+## 发布页
+
+GitHub 仓库：
+https://github.com/zjmxczhy/foo_speaklyrics
+
+GitHub 发布页：
+https://github.com/zjmxczhy/foo_speaklyrics/releases
+
+Gitee 仓库：
+https://gitee.com/zjmxczhy/foo_speaklyrics
+
+Gitee 发布页：
+https://gitee.com/zjmxczhy/foo_speaklyrics/releases
+
+当前版本安装包和完整更新日志、使用方法请从对应发布页下载。
