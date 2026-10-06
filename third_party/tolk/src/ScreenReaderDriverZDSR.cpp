@@ -44,7 +44,11 @@ ScreenReaderDriverZDSR::ScreenReaderDriverZDSR() :
   }
 }
 ScreenReaderDriverZDSR::~ScreenReaderDriverZDSR() {
-  if (controller) FreeLibrary(controller);
+  // InitTTS starts internal threads/hooks, but ZDSRAPI exposes no shutdown
+  // operation that can join them. Keep the acquired module reference for the
+  // process lifetime, including during Tolk's static-object destruction.
+  // StopSpeak is a speech cancellation API, not a DLL/thread shutdown API.
+  controller = nullptr;
 }
 bool ScreenReaderDriverZDSR::Speak(const wchar_t *str, bool interrupt) {
   if (zdsrSpeak) return (zdsrSpeak(str, interrupt) == 0);
